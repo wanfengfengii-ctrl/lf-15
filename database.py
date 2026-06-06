@@ -145,6 +145,93 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            strategy_type TEXT NOT NULL,
+            optimization_target TEXT,
+            decision_reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (scenario_id) REFERENCES scenarios (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            metric_key TEXT NOT NULL,
+            metric_value REAL NOT NULL,
+            FOREIGN KEY (strategy_id) REFERENCES decision_strategies (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_sim_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            time_hour REAL NOT NULL,
+            tide_level REAL NOT NULL,
+            water_level REAL NOT NULL,
+            water_volume REAL NOT NULL,
+            gate_open_ratio REAL NOT NULL,
+            mill_running INTEGER NOT NULL,
+            overflow_flag INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (strategy_id) REFERENCES decision_strategies (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_mill_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            start_hour REAL NOT NULL,
+            end_hour REAL NOT NULL,
+            FOREIGN KEY (strategy_id) REFERENCES decision_strategies (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_gate_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            start_hour REAL NOT NULL,
+            end_hour REAL NOT NULL,
+            open_ratio REAL NOT NULL,
+            action TEXT NOT NULL,
+            FOREIGN KEY (strategy_id) REFERENCES decision_strategies (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_risk_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            action_description TEXT,
+            start_hour REAL,
+            end_hour REAL,
+            priority TEXT,
+            FOREIGN KEY (strategy_id) REFERENCES decision_strategies (id) ON DELETE CASCADE
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -515,3 +602,306 @@ def delete_optimization_run(run_id: int):
     cursor.execute("DELETE FROM optimization_runs WHERE id = ?", (run_id,))
     conn.commit()
     conn.close()
+
+
+def create_strategy(
+    scenario_id: int,
+    name: str,
+    description: str,
+    strategy_type: str,
+    optimization_target: str = None,
+    decision_reason: str = None,
+) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO decision_strategies 
+        (scenario_id, name, description, strategy_type, optimization_target, decision_reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (scenario_id, name, description, strategy_type, optimization_target, decision_reason),
+    )
+    strategy_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+    return strategy_id
+
+
+def save_strategy_simulation_data(
+    strategy_id: int,
+    simulation_results: List[Dict[str, float]],
+    metrics: Dict[str, float],
+    mill_schedule: List[Dict[str, float]],
+    gate_schedule: List[Dict[str, float]],
+    reservoir_capacity: float = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM strategy_sim_data WHERE strategy_id = ?", (strategy_id,))
+    cursor.execute("DELETE FROM strategy_metrics WHERE strategy_id = ?", (strategy_id,))
+    cursor.execute("DELETE FROM strategy_mill_schedule WHERE strategy_id = ?", (strategy_id,))
+    cursor.execute("DELETE FROM strategy_gate_schedule WHERE strategy_id = ?", (strategy_id,))
+
+    for r in simulation_results:
+        overflow_flag = 0
+        if reservoir_capacity is not None:
+            overflow_flag = 1 if r.get("water_volume", 0) >= reservoir_capacity - 0.01 else 0
+        cursor.execute(
+            """
+            INSERT INTO strategy_sim_data 
+            (strategy_id, time_hour, tide_level, water_level, water_volume, 
+             gate_open_ratio, mill_running, overflow_flag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                strategy_id,
+                r["time_hour"],
+                r["tide_level"],
+                r["water_level"],
+                r.get("water_volume", 0),
+                r["gate_open_ratio"],
+                1 if r.get("mill_running", False) else 0,
+                overflow_flag,
+            ),
+        )
+
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            cursor.execute(
+                """
+                INSERT INTO strategy_metrics (strategy_id, metric_key, metric_value)
+                VALUES (?, ?, ?)
+                """,
+                (strategy_id, key, float(value)),
+            )
+
+    for sched in mill_schedule:
+        cursor.execute(
+            """
+            INSERT INTO strategy_mill_schedule (strategy_id, start_hour, end_hour)
+            VALUES (?, ?, ?)
+            """,
+            (strategy_id, sched["start_hour"], sched["end_hour"]),
+        )
+
+    for g in gate_schedule:
+        cursor.execute(
+            """
+            INSERT INTO strategy_gate_schedule (strategy_id, start_hour, end_hour, open_ratio, action)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (strategy_id, g["start_hour"], g["end_hour"], g["open_ratio"], g["action"]),
+        )
+
+    cursor.execute(
+        "UPDATE decision_strategies SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (strategy_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_strategy_risk_actions(
+    strategy_id: int,
+    risk_actions: List[Dict],
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM strategy_risk_actions WHERE strategy_id = ?", (strategy_id,))
+
+    for action in risk_actions:
+        cursor.execute(
+            """
+            INSERT INTO strategy_risk_actions 
+            (strategy_id, action_type, action_description, start_hour, end_hour, priority)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                strategy_id,
+                action.get("action_type", ""),
+                action.get("action_description", ""),
+                action.get("start_hour"),
+                action.get("end_hour"),
+                action.get("priority"),
+            ),
+        )
+
+    cursor.execute(
+        "UPDATE decision_strategies SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (strategy_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def list_strategies(scenario_id: int) -> List[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT * FROM decision_strategies 
+        WHERE scenario_id = ? 
+        ORDER BY updated_at DESC
+        """,
+        (scenario_id,),
+    )
+    strategies = [dict(row) for row in cursor.fetchall()]
+
+    conn.close()
+    return strategies
+
+
+def get_strategy(strategy_id: int) -> Optional[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM decision_strategies WHERE id = ?", (strategy_id,))
+    strategy_row = cursor.fetchone()
+
+    if not strategy_row:
+        conn.close()
+        return None
+
+    strategy = dict(strategy_row)
+
+    cursor.execute(
+        "SELECT metric_key, metric_value FROM strategy_metrics WHERE strategy_id = ?",
+        (strategy_id,),
+    )
+    metrics = {}
+    for row in cursor.fetchall():
+        metrics[row["metric_key"]] = row["metric_value"]
+    strategy["metrics"] = metrics
+
+    cursor.execute(
+        "SELECT start_hour, end_hour FROM strategy_mill_schedule WHERE strategy_id = ? ORDER BY start_hour",
+        (strategy_id,),
+    )
+    mill_schedule = [dict(row) for row in cursor.fetchall()]
+    strategy["mill_schedule"] = mill_schedule
+
+    cursor.execute(
+        "SELECT start_hour, end_hour, open_ratio, action FROM strategy_gate_schedule WHERE strategy_id = ? ORDER BY start_hour",
+        (strategy_id,),
+    )
+    gate_schedule = [dict(row) for row in cursor.fetchall()]
+    strategy["gate_schedule"] = gate_schedule
+
+    cursor.execute(
+        """
+        SELECT time_hour, tide_level, water_level, water_volume, 
+               gate_open_ratio, mill_running, overflow_flag
+        FROM strategy_sim_data WHERE strategy_id = ? ORDER BY time_hour
+        """,
+        (strategy_id,),
+    )
+    sim_data = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        d["mill_running"] = bool(d["mill_running"])
+        d["overflow_flag"] = bool(d["overflow_flag"])
+        sim_data.append(d)
+    strategy["simulation_results"] = sim_data
+
+    cursor.execute(
+        """
+        SELECT id, action_type, action_description, start_hour, end_hour, priority
+        FROM strategy_risk_actions WHERE strategy_id = ? ORDER BY id
+        """,
+        (strategy_id,),
+    )
+    risk_actions = [dict(row) for row in cursor.fetchall()]
+    strategy["risk_actions"] = risk_actions
+
+    conn.close()
+    return strategy
+
+
+def update_strategy(
+    strategy_id: int,
+    name: str = None,
+    description: str = None,
+    decision_reason: str = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    fields = []
+    values = []
+
+    if name is not None:
+        fields.append("name = ?")
+        values.append(name)
+    if description is not None:
+        fields.append("description = ?")
+        values.append(description)
+    if decision_reason is not None:
+        fields.append("decision_reason = ?")
+        values.append(decision_reason)
+
+    if fields:
+        fields.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(strategy_id)
+        cursor.execute(
+            f"UPDATE decision_strategies SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+
+    conn.close()
+
+
+def delete_strategy(strategy_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM decision_strategies WHERE id = ?", (strategy_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_strategy_simulation_timeseries(strategy_id: int) -> List[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT time_hour, tide_level, water_level, water_volume,
+               gate_open_ratio, mill_running, overflow_flag
+        FROM strategy_sim_data WHERE strategy_id = ? ORDER BY time_hour
+        """,
+        (strategy_id,),
+    )
+    results = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        d["mill_running"] = bool(d["mill_running"])
+        d["overflow_flag"] = bool(d["overflow_flag"])
+        results.append(d)
+
+    conn.close()
+    return results
+
+
+def compare_strategies_metrics(strategy_ids: List[int]) -> List[Dict]:
+    results = []
+    for sid in strategy_ids:
+        strategy = get_strategy(sid)
+        if strategy:
+            results.append({
+                "id": strategy["id"],
+                "name": strategy["name"],
+                "strategy_type": strategy["strategy_type"],
+                "optimization_target": strategy.get("optimization_target"),
+                "description": strategy.get("description"),
+                "metrics": strategy.get("metrics", {}),
+                "created_at": strategy.get("created_at"),
+            })
+    return results

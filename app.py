@@ -60,6 +60,27 @@ from risk_assessment import (
     get_risk_level_color,
     get_risk_level_label,
 )
+from database import (
+    create_strategy,
+    save_strategy_simulation_data,
+    save_strategy_risk_actions,
+    list_strategies,
+    get_strategy,
+    update_strategy,
+    delete_strategy,
+    get_strategy_simulation_timeseries,
+    compare_strategies_metrics,
+)
+from decision_review import (
+    compare_strategies,
+    build_timeline_analysis,
+    generate_strategy_from_optimization,
+    generate_strategy_from_manual,
+    generate_risk_actions_from_recommendations,
+    format_metric_value,
+    get_metric_label,
+    RiskAction,
+)
 
 
 st.set_page_config(
@@ -283,7 +304,7 @@ with st.sidebar:
         st.session_state["needs_simulation"] = True
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比", "📅 多日优化排程", "⚠️ 风险预警决策"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比", "📅 多日优化排程", "⚠️ 风险预警决策", "📜 协同决策与方案复盘"])
 
 with tab1:
     st.header("方案信息")
@@ -2516,3 +2537,728 @@ with tab6:
         )
 
         st.plotly_chart(water_compare_fig, use_container_width=True)
+
+with tab7:
+    st.header("📜 协同决策与历史方案复盘")
+    st.markdown("保存多套调度策略，记录决策理由与风险处置动作，通过时间轴复盘不同策略的产量、溢流、停机和风险变化全过程")
+
+    if "decision_strategy_name" not in st.session_state:
+        st.session_state["decision_strategy_name"] = ""
+    if "decision_strategy_desc" not in st.session_state:
+        st.session_state["decision_strategy_desc"] = ""
+    if "decision_reason" not in st.session_state:
+        st.session_state["decision_reason"] = ""
+    if "selected_strategies_compare" not in st.session_state:
+        st.session_state["selected_strategies_compare"] = []
+    if "strategy_timeline_data" not in st.session_state:
+        st.session_state["strategy_timeline_data"] = None
+    if "strategy_compare_result" not in st.session_state:
+        st.session_state["strategy_compare_result"] = None
+    if "review_window_hours" not in st.session_state:
+        st.session_state["review_window_hours"] = 6.0
+    if "active_strategy_detail" not in st.session_state:
+        st.session_state["active_strategy_detail"] = None
+    if "risk_actions_temp" not in st.session_state:
+        st.session_state["risk_actions_temp"] = []
+
+    scenario_id = st.session_state.get("scenario_id")
+
+    if not scenario_id:
+        st.info("💡 请先在左侧保存一个方案，然后在此处进行决策策略的保存与复盘分析")
+    else:
+        strategies = list_strategies(scenario_id)
+
+        with st.expander("💾 保存当前策略", expanded=True):
+            st.subheader("保存当前调度策略")
+            st.caption("将当前模拟或优化结果保存为一个决策策略，记录决策理由和风险处置动作")
+
+            col_s1, col_s2 = st.columns([2, 1])
+            with col_s1:
+                strategy_name = st.text_input(
+                    "策略名称",
+                    value=st.session_state["decision_strategy_name"],
+                    key="strategy_name_input",
+                    placeholder="例如：汛期高产方案、低水位节水策略",
+                )
+            with col_s2:
+                strategy_type = st.selectbox(
+                    "策略类型",
+                    options=["optimized", "manual", "baseline"],
+                    format_func=lambda x: "🤖 自动优化" if x == "optimized" else
+                                          ("✋ 手动调度" if x == "manual" else "📊 基准方案"),
+                    key="strategy_type_select",
+                )
+
+            strategy_desc = st.text_input(
+                "策略描述",
+                value=st.session_state["decision_strategy_desc"],
+                key="strategy_desc_input",
+                placeholder="简要描述该策略的适用场景和特点",
+            )
+
+            decision_reason = st.text_area(
+                "📝 决策理由",
+                value=st.session_state["decision_reason"],
+                height=80,
+                key="decision_reason_input",
+                placeholder="记录选择此策略的原因、依据、预期效果等",
+            )
+
+            col_sa1, col_sa2 = st.columns(2)
+            with col_sa1:
+                save_source = st.radio(
+                    "数据来源",
+                    options=["current_sim", "current_opt"],
+                    format_func=lambda x: "📊 当前模拟结果" if x == "current_sim" else "🎯 当前优化结果",
+                    horizontal=True,
+                    key="save_source_radio",
+                )
+            with col_sa2:
+                st.write("")
+                st.write("")
+                st.caption("选择将哪个结果保存为决策策略")
+
+            st.divider()
+            st.markdown("**🚨 风险处置记录**")
+            st.caption("记录该策略对应的风险处置动作和应急方案")
+
+            action_type_options = [
+                "闸门调节", "磨坊调度", "预泄腾库", "蓄水保水",
+                "设备检修", "人员调度", "物资准备", "应急预案", "其他"
+            ]
+            priority_options = ["critical", "high", "medium", "low"]
+            priority_labels = {"critical": "紧急", "high": "高", "medium": "中", "low": "低"}
+
+            col_ar1, col_ar2, col_ar3, col_ar4, col_ar5 = st.columns([2, 3, 1, 1, 1])
+            with col_ar1:
+                new_action_type = st.selectbox(
+                    "动作类型",
+                    options=action_type_options,
+                    key="new_action_type",
+                )
+            with col_ar2:
+                new_action_desc = st.text_input(
+                    "动作描述",
+                    key="new_action_desc",
+                    placeholder="描述具体的风险处置动作",
+                )
+            with col_ar3:
+                new_action_start = st.number_input(
+                    "开始(h)",
+                    min_value=0.0,
+                    max_value=200.0,
+                    value=0.0,
+                    step=1.0,
+                    key="new_action_start",
+                )
+            with col_ar4:
+                new_action_end = st.number_input(
+                    "结束(h)",
+                    min_value=0.0,
+                    max_value=200.0,
+                    value=24.0,
+                    step=1.0,
+                    key="new_action_end",
+                )
+            with col_ar5:
+                new_action_priority = st.selectbox(
+                    "优先级",
+                    options=priority_options,
+                    format_func=lambda x: priority_labels[x],
+                    key="new_action_priority",
+                )
+
+            if st.button("➕ 添加风险处置动作", use_container_width=True, key="add_risk_action"):
+                new_action = {
+                    "action_type": new_action_type,
+                    "action_description": new_action_desc,
+                    "start_hour": new_action_start,
+                    "end_hour": new_action_end,
+                    "priority": new_action_priority,
+                }
+                st.session_state["risk_actions_temp"].append(new_action)
+                st.success("已添加风险处置动作")
+                st.rerun()
+
+            if st.session_state["risk_actions_temp"]:
+                st.markdown("**已记录的风险处置动作：**")
+                for i, action in enumerate(st.session_state["risk_actions_temp"]):
+                    col_a1, col_a2, col_a3 = st.columns([5, 1, 1])
+                    with col_a1:
+                        st.caption(
+                            f"[{priority_labels.get(action['priority'], '中')}] "
+                            f"{action['action_type']}: {action['action_description']} "
+                            f"(第{action['start_hour']:.0f}h - 第{action['end_hour']:.0f}h)"
+                        )
+                    with col_a3:
+                        if st.button("🗑️", key=f"del_action_{i}"):
+                            st.session_state["risk_actions_temp"].pop(i)
+                            st.rerun()
+
+            col_save_btn1, col_save_btn2 = st.columns(2)
+            with col_save_btn1:
+                if st.button("💾 保存策略", use_container_width=True, type="primary", key="save_strategy_btn"):
+                    if not strategy_name:
+                        st.error("请输入策略名称")
+                    else:
+                        try:
+                            params = SimulationParams(
+                                reservoir_capacity=st.session_state["reservoir_capacity"],
+                                reservoir_area=st.session_state["reservoir_area"],
+                                gate_max_flow=st.session_state["gate_max_flow"],
+                                mill_power_consumption=st.session_state["mill_power_consumption"],
+                                initial_water_level=st.session_state["initial_water_level"],
+                            )
+
+                            sim_results = None
+                            metrics = None
+                            mill_sched = None
+                            gate_sched = None
+                            opt_target = None
+
+                            if save_source == "current_opt" and st.session_state.get("optimization_results") is not None:
+                                opt_result = st.session_state["optimization_results"]
+                                sim_results = opt_result.simulation_results
+                                metrics = opt_result.metrics
+                                mill_sched = opt_result.mill_schedule
+                                gate_sched = opt_result.gate_schedule
+                                opt_target = opt_result.target
+                            else:
+                                tide_records = st.session_state.get("tide_records", generate_default_tide_records())
+                                mill_schedule = st.session_state.get("mill_schedule", generate_default_mill_schedule())
+                                manual_gate = None
+                                if st.session_state.get("gate_mode") == "manual":
+                                    manual_gate = st.session_state.get("manual_gate_schedule")
+
+                                sim_results, gate_sched, warns = run_simulation(
+                                    params, tide_records, mill_schedule,
+                                    manual_gate_schedule=manual_gate,
+                                )
+                                metrics = compute_simulation_metrics(sim_results, params)
+                                mill_sched = mill_schedule
+
+                            new_strategy_id = create_strategy(
+                                scenario_id=scenario_id,
+                                name=strategy_name,
+                                description=strategy_desc,
+                                strategy_type=strategy_type,
+                                optimization_target=opt_target,
+                                decision_reason=decision_reason,
+                            )
+
+                            save_strategy_simulation_data(
+                                new_strategy_id,
+                                sim_results,
+                                metrics,
+                                mill_sched,
+                                gate_sched,
+                                reservoir_capacity=params.reservoir_capacity,
+                            )
+
+                            if st.session_state["risk_actions_temp"]:
+                                save_strategy_risk_actions(
+                                    new_strategy_id,
+                                    st.session_state["risk_actions_temp"],
+                                )
+
+                            st.session_state["decision_strategy_name"] = ""
+                            st.session_state["decision_strategy_desc"] = ""
+                            st.session_state["decision_reason"] = ""
+                            st.session_state["risk_actions_temp"] = []
+                            st.success(f"✅ 策略已保存！策略ID: {new_strategy_id}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"保存失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+            with col_save_btn2:
+                if st.button("🗑️ 清空表单", use_container_width=True, key="clear_strategy_form"):
+                    st.session_state["decision_strategy_name"] = ""
+                    st.session_state["decision_strategy_desc"] = ""
+                    st.session_state["decision_reason"] = ""
+                    st.session_state["risk_actions_temp"] = []
+                    st.rerun()
+
+        st.divider()
+
+        with st.expander("📋 已保存策略列表", expanded=True):
+            if not strategies:
+                st.info("暂无已保存的策略，请先保存一个策略")
+            else:
+                st.info(f"共有 {len(strategies)} 个已保存的决策策略")
+
+                strategy_type_display = {
+                    "optimized": "🤖 自动优化",
+                    "manual": "✋ 手动调度",
+                    "baseline": "📊 基准方案",
+                }
+
+                strat_data = []
+                for s in strategies:
+                    strat_data.append({
+                        "ID": s["id"],
+                        "策略名称": s["name"],
+                        "类型": strategy_type_display.get(s["strategy_type"], s["strategy_type"]),
+                        "描述": s.get("description", ""),
+                        "更新时间": s["updated_at"],
+                    })
+
+                st.dataframe(pd.DataFrame(strat_data), use_container_width=True, hide_index=True)
+
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    selected_ids = st.multiselect(
+                        "选择要对比分析的策略",
+                        options=[s["id"] for s in strategies],
+                        format_func=lambda x: next(
+                            (s["name"] for s in strategies if s["id"] == x), str(x)
+                        ),
+                        default=st.session_state.get("selected_strategies_compare", []),
+                        key="compare_strategies_select",
+                    )
+                with col_m2:
+                    window_hours = st.slider(
+                        "滚动分析窗口 (小时)",
+                        min_value=1.0,
+                        max_value=24.0,
+                        value=st.session_state["review_window_hours"],
+                        step=1.0,
+                        key="window_hours_slider",
+                        help="用于计算滚动产量和风险指标的时间窗口大小",
+                    )
+                    st.session_state["review_window_hours"] = window_hours
+
+                if st.button("🔍 开始对比分析", use_container_width=True, type="primary",
+                             key="run_strategy_compare", disabled=len(selected_ids) < 2):
+                    if len(selected_ids) < 2:
+                        st.warning("请至少选择2个策略进行对比")
+                    else:
+                        with st.spinner("正在进行策略对比分析..."):
+                            try:
+                                strategies_data = []
+                                strategy_names = []
+
+                                for sid in selected_ids:
+                                    strat = get_strategy(sid)
+                                    if strat:
+                                        strategies_data.append(strat)
+                                        strategy_names.append(strat["name"])
+
+                                params = SimulationParams(
+                                    reservoir_capacity=st.session_state["reservoir_capacity"],
+                                    reservoir_area=st.session_state["reservoir_area"],
+                                    gate_max_flow=st.session_state["gate_max_flow"],
+                                    mill_power_consumption=st.session_state["mill_power_consumption"],
+                                    initial_water_level=st.session_state["initial_water_level"],
+                                )
+
+                                compare_result = compare_strategies(
+                                    strategies_data, strategy_names
+                                )
+                                timeline = build_timeline_analysis(
+                                    strategies_data, strategy_names,
+                                    params, window_hours,
+                                )
+
+                                st.session_state["selected_strategies_compare"] = selected_ids
+                                st.session_state["strategy_compare_result"] = compare_result
+                                st.session_state["strategy_timeline_data"] = timeline
+                                st.success("✅ 对比分析完成!")
+                            except Exception as e:
+                                st.error(f"对比分析失败: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+        if st.session_state.get("strategy_compare_result") is not None:
+            st.divider()
+            st.subheader("📊 策略指标对比")
+
+            comp_result = st.session_state["strategy_compare_result"]
+
+            compare_table_data = []
+            metric_order = [
+                "total_mill_hours", "total_gate_open_hours", "overflow_volume",
+                "avg_water_volume", "max_water_volume", "min_water_volume",
+                "capacity_utilization_pct", "total_inflow",
+            ]
+
+            for key in metric_order:
+                if key in comp_result.metrics_comparison:
+                    row = {"指标": get_metric_label(key)}
+                    for i, name in enumerate(comp_result.strategy_names):
+                        value = comp_result.metrics_comparison[key][i]
+                        row[name] = format_metric_value(key, value)
+                    row["最优策略"] = comp_result.best_by_metric.get(key, "-")
+                    compare_table_data.append(row)
+
+            st.dataframe(pd.DataFrame(compare_table_data), use_container_width=True, hide_index=True)
+
+            st.markdown(f"**🏆 综合排名：** {' → '.join(comp_result.overall_ranking)}")
+
+            st.subheader("📈 关键指标对比图")
+
+            col_gm1, col_gm2, col_gm3 = st.columns(3)
+            with col_gm1:
+                bar_mill = go.Figure()
+                for i, name in enumerate(comp_result.strategy_names):
+                    mill_hours = comp_result.metrics_comparison.get("total_mill_hours", [0])[i]
+                    bar_mill.add_trace(go.Bar(
+                        x=[name], y=[mill_hours], name=name,
+                        marker_color=f"hsla({i * 60}, 70%, 50%, 0.8)",
+                    ))
+                bar_mill.update_layout(
+                    title="磨坊运行时长对比",
+                    height=300,
+                    showlegend=False,
+                    yaxis_title="时长 (h)",
+                )
+                st.plotly_chart(bar_mill, use_container_width=True)
+
+            with col_gm2:
+                bar_overflow = go.Figure()
+                for i, name in enumerate(comp_result.strategy_names):
+                    overflow = comp_result.metrics_comparison.get("overflow_volume", [0])[i]
+                    bar_overflow.add_trace(go.Bar(
+                        x=[name], y=[overflow], name=name,
+                        marker_color=f"hsla({i * 60 + 10}, 70%, 50%, 0.8)",
+                    ))
+                bar_overflow.update_layout(
+                    title="溢流水量对比",
+                    height=300,
+                    showlegend=False,
+                    yaxis_title="水量 (m³)",
+                )
+                st.plotly_chart(bar_overflow, use_container_width=True)
+
+            with col_gm3:
+                bar_cap = go.Figure()
+                for i, name in enumerate(comp_result.strategy_names):
+                    cap_util = comp_result.metrics_comparison.get("capacity_utilization_pct", [0])[i]
+                    bar_cap.add_trace(go.Bar(
+                        x=[name], y=[cap_util], name=name,
+                        marker_color=f"hsla({i * 60 + 30}, 70%, 50%, 0.8)",
+                    ))
+                bar_cap.update_layout(
+                    title="库容利用率对比",
+                    height=300,
+                    showlegend=False,
+                    yaxis_title="利用率 (%)",
+                )
+                st.plotly_chart(bar_cap, use_container_width=True)
+
+        if st.session_state.get("strategy_timeline_data") is not None:
+            st.divider()
+            st.subheader("⏱️ 时间轴全过程复盘")
+
+            timeline = st.session_state["strategy_timeline_data"]
+            strategy_names = timeline.time_hours and [name for name in timeline.water_volumes.keys()]
+
+            if not strategy_names:
+                strategy_names = []
+
+            colors_list = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+            time_days = [t / 24 for t in timeline.time_hours]
+
+            st.markdown("**📈 蓄水量变化对比**")
+            fig_water = go.Figure()
+
+            for i, name in enumerate(strategy_names):
+                fig_water.add_trace(go.Scatter(
+                    x=time_days,
+                    y=timeline.water_volumes[name],
+                    name=name,
+                    line=dict(color=colors_list[i % len(colors_list)], width=2),
+                ))
+
+            fig_water.add_hline(
+                y=st.session_state["reservoir_capacity"],
+                line_dash="dash",
+                line_color="red",
+                annotation_text="容量上限",
+                annotation_position="right",
+            )
+
+            fig_water.update_layout(
+                height=350,
+                hovermode="x unified",
+                xaxis_title="时间 (天)",
+                yaxis_title="蓄水量 (m³)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_water, use_container_width=True)
+
+            st.markdown("**🚪 闸门开启比例对比**")
+            fig_gate = go.Figure()
+
+            for i, name in enumerate(strategy_names):
+                fig_gate.add_trace(go.Scatter(
+                    x=time_days,
+                    y=timeline.gate_ratios[name],
+                    name=name,
+                    line=dict(color=colors_list[i % len(colors_list)], width=2),
+                ))
+
+            fig_gate.update_layout(
+                height=300,
+                hovermode="x unified",
+                xaxis_title="时间 (天)",
+                yaxis_title="开启比例 (%)",
+                yaxis_range=[0, 105],
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_gate, use_container_width=True)
+
+            st.markdown("**⚡ 滚动产量变化**")
+            st.caption(f"滚动窗口：{st.session_state['review_window_hours']} 小时")
+
+            fig_yield = go.Figure()
+            for i, name in enumerate(strategy_names):
+                yield_data = timeline.rolling_yield.get(name, [])
+                yield_times = [t / 24 for t in timeline.time_hours[:len(yield_data)]]
+                fig_yield.add_trace(go.Scatter(
+                    x=yield_times,
+                    y=yield_data,
+                    name=name,
+                    line=dict(color=colors_list[i % len(colors_list)], width=2),
+                    fill="tozeroy",
+                    fillcolor=f"rgba({int(colors_list[i % len(colors_list)][1:3], 16)}, "
+                              f"{int(colors_list[i % len(colors_list)][3:5], 16)}, "
+                              f"{int(colors_list[i % len(colors_list)][5:7], 16)}, 0.15)",
+                ))
+
+            fig_yield.update_layout(
+                height=300,
+                hovermode="x unified",
+                xaxis_title="时间 (天)",
+                yaxis_title="滚动产量 (磨坊小时数)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_yield, use_container_width=True)
+
+            st.markdown("**⚠️ 滚动风险变化**")
+
+            risk_tabs = st.tabs(["溢流风险", "缺水风险", "停机风险"])
+
+            with risk_tabs[0]:
+                fig_overflow_risk = go.Figure()
+                for i, name in enumerate(strategy_names):
+                    risk_data = timeline.rolling_risk.get(name, {}).get("overflow", [])
+                    risk_times = [t / 24 for t in timeline.time_hours[:len(risk_data)]]
+                    fig_overflow_risk.add_trace(go.Scatter(
+                        x=risk_times,
+                        y=risk_data,
+                        name=name,
+                        line=dict(color=colors_list[i % len(colors_list)], width=2),
+                    ))
+
+                fig_overflow_risk.add_hrect(
+                    y0=70, y1=100,
+                    fillcolor="rgba(214, 39, 40, 0.15)",
+                    line_width=0,
+                    annotation_text="高风险区",
+                    annotation_position="right",
+                )
+
+                fig_overflow_risk.update_layout(
+                    height=280,
+                    hovermode="x unified",
+                    xaxis_title="时间 (天)",
+                    yaxis_title="溢流风险 (%)",
+                    yaxis_range=[0, 105],
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_overflow_risk, use_container_width=True)
+
+            with risk_tabs[1]:
+                fig_shortage_risk = go.Figure()
+                for i, name in enumerate(strategy_names):
+                    risk_data = timeline.rolling_risk.get(name, {}).get("shortage", [])
+                    risk_times = [t / 24 for t in timeline.time_hours[:len(risk_data)]]
+                    fig_shortage_risk.add_trace(go.Scatter(
+                        x=risk_times,
+                        y=risk_data,
+                        name=name,
+                        line=dict(color=colors_list[i % len(colors_list)], width=2),
+                    ))
+
+                fig_shortage_risk.add_hrect(
+                    y0=70, y1=100,
+                    fillcolor="rgba(255, 127, 14, 0.15)",
+                    line_width=0,
+                    annotation_text="高风险区",
+                    annotation_position="right",
+                )
+
+                fig_shortage_risk.update_layout(
+                    height=280,
+                    hovermode="x unified",
+                    xaxis_title="时间 (天)",
+                    yaxis_title="缺水风险 (%)",
+                    yaxis_range=[0, 105],
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_shortage_risk, use_container_width=True)
+
+            with risk_tabs[2]:
+                fig_shutdown_risk = go.Figure()
+                for i, name in enumerate(strategy_names):
+                    risk_data = timeline.rolling_risk.get(name, {}).get("shutdown", [])
+                    risk_times = [t / 24 for t in timeline.time_hours[:len(risk_data)]]
+                    fig_shutdown_risk.add_trace(go.Scatter(
+                        x=risk_times,
+                        y=risk_data,
+                        name=name,
+                        line=dict(color=colors_list[i % len(colors_list)], width=2),
+                    ))
+
+                fig_shutdown_risk.add_hrect(
+                    y0=70, y1=100,
+                    fillcolor="rgba(148, 103, 189, 0.15)",
+                    line_width=0,
+                    annotation_text="高风险区",
+                    annotation_position="right",
+                )
+
+                fig_shutdown_risk.update_layout(
+                    height=280,
+                    hovermode="x unified",
+                    xaxis_title="时间 (天)",
+                    yaxis_title="停机风险 (%)",
+                    yaxis_range=[0, 105],
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_shutdown_risk, use_container_width=True)
+
+        st.divider()
+
+        with st.expander("🔍 策略详情查看", expanded=False):
+            st.subheader("查看单个策略的详细信息")
+
+            detail_options = [s["id"] for s in strategies]
+            detail_labels = {s["id"]: s["name"] for s in strategies}
+
+            selected_detail_id = st.selectbox(
+                "选择策略",
+                options=detail_options,
+                format_func=lambda x: detail_labels.get(x, str(x)),
+                key="strategy_detail_select",
+            )
+
+            if selected_detail_id:
+                detail = get_strategy(selected_detail_id)
+                if detail:
+                    st.markdown(f"### {detail['name']}")
+                    st.caption(f"ID: {detail['id']} | 类型: {detail.get('strategy_type', '')}")
+
+                    if detail.get("description"):
+                        st.write(f"**描述：** {detail['description']}")
+
+                    if detail.get("decision_reason"):
+                        st.markdown("**📝 决策理由**")
+                        st.info(detail["decision_reason"])
+
+                    if detail.get("metrics"):
+                        st.markdown("**📊 关键指标**")
+                        metrics_data = []
+                        for key, value in detail["metrics"].items():
+                            metrics_data.append({
+                                "指标": get_metric_label(key),
+                                "数值": format_metric_value(key, value),
+                            })
+                        st.dataframe(pd.DataFrame(metrics_data), use_container_width=True, hide_index=True)
+
+                    if detail.get("risk_actions"):
+                        st.markdown("**🚨 风险处置动作**")
+                        priority_colors = {
+                            "critical": "#9400d3",
+                            "high": "#d62728",
+                            "medium": "#ff7f0e",
+                            "low": "#2ca02c",
+                        }
+                        priority_labels_map = {
+                            "critical": "紧急", "high": "高优先级",
+                            "medium": "中优先级", "low": "低优先级",
+                        }
+                        for action in detail["risk_actions"]:
+                            prio = action.get("priority", "medium")
+                            color = priority_colors.get(prio, "#7f7f7f")
+                            label = priority_labels_map.get(prio, "未知")
+                            with st.expander(
+                                f"{'🔴' if prio == 'critical' else '🟠' if prio == 'high' else '🟡' if prio == 'medium' else '🟢'} "
+                                f"{action.get('action_type', '')}: {action.get('action_description', '')[:50]}...",
+                                expanded=False,
+                            ):
+                                st.markdown(f"<span style='color:{color};font-weight:bold;'>优先级：{label}</span>",
+                                            unsafe_allow_html=True)
+                                st.write(f"**类型：** {action.get('action_type', '')}")
+                                st.write(f"**描述：** {action.get('action_description', '')}")
+                                if action.get("start_hour") is not None and action.get("end_hour") is not None:
+                                    st.write(f"**时间窗口：** 第 {action['start_hour']:.1f}h - 第 {action['end_hour']:.1f}h")
+
+                    if detail.get("simulation_results"):
+                        st.markdown("**📈 模拟曲线**")
+                        df_detail = pd.DataFrame(detail["simulation_results"])
+
+                        fig_detail = make_subplots(
+                            rows=3, cols=1,
+                            shared_xaxes=True,
+                            vertical_spacing=0.08,
+                            subplot_titles=("蓄水量 (m³)", "闸门开启比例 (%)", "磨坊运行状态"),
+                            row_heights=[0.4, 0.3, 0.3],
+                        )
+
+                        has_data = len(df_detail) > 0
+                        max_hour = df_detail["time_hour"].max() if has_data else 0
+                        use_days = max_hour > 48
+                        x_values = df_detail["time_hour"] / 24 if use_days else df_detail["time_hour"]
+                        x_label = "时间 (天)" if use_days else "时间 (小时)"
+
+                        fig_detail.add_trace(
+                            go.Scatter(x=x_values, y=df_detail["water_volume"],
+                                       name="蓄水量", line=dict(color="#2ca02c", width=2)),
+                            row=1, col=1,
+                        )
+                        fig_detail.add_hline(
+                            y=st.session_state["reservoir_capacity"],
+                            line_dash="dash", line_color="red",
+                            row=1, col=1,
+                        )
+
+                        fig_detail.add_trace(
+                            go.Scatter(x=x_values, y=df_detail["gate_open_ratio"],
+                                       name="闸门比例", line=dict(color="#9467bd", width=2)),
+                            row=2, col=1,
+                        )
+
+                        mill_states = [100 if m else 0 for m in df_detail.get("mill_running", [])]
+                        fig_detail.add_trace(
+                            go.Scatter(x=x_values, y=mill_states,
+                                       name="磨坊运行", fill="tozeroy",
+                                       line=dict(color="#ff7f0e", width=0),
+                                       fillcolor="rgba(255, 127, 14, 0.3)"),
+                            row=3, col=1,
+                        )
+                        fig_detail.update_yaxes(range=[0, 105], row=3, col=1)
+
+                        fig_detail.update_layout(
+                            height=500,
+                            hovermode="x unified",
+                            showlegend=False,
+                        )
+                        fig_detail.update_xaxes(title_text=x_label, row=3, col=1)
+
+                        st.plotly_chart(fig_detail, use_container_width=True)
+
+                    col_d1, col_d2 = st.columns(2)
+                    with col_d1:
+                        if st.button("🗑️ 删除此策略", use_container_width=True, key="delete_strategy_btn"):
+                            delete_strategy(selected_detail_id)
+                            st.success("策略已删除")
+                            st.rerun()
+                    with col_d2:
+                        st.caption("删除后不可恢复")
+
+        st.divider()
+        st.caption("💡 提示：您可以在「多日优化排程」和「风险预警决策」标签页完成分析后，回到此处保存策略并进行对比复盘")

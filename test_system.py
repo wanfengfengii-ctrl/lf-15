@@ -5,6 +5,9 @@ from database import (
     init_db, create_scenario, list_scenarios, get_scenario,
     copy_scenario, delete_scenario, save_simulation_results, get_simulation_results,
     save_optimization_run, get_optimization_runs, get_optimization_run_detail, delete_optimization_run,
+    create_strategy, save_strategy_simulation_data, save_strategy_risk_actions,
+    list_strategies, get_strategy, update_strategy, delete_strategy,
+    get_strategy_simulation_timeseries, compare_strategies_metrics,
 )
 from simulation import (
     SimulationParams, run_simulation, validate_tide_records,
@@ -41,6 +44,16 @@ from risk_assessment import (
     has_rainfall,
     has_equipment_failure,
     get_disturbance_time_window,
+)
+from decision_review import (
+    compare_strategies,
+    build_timeline_analysis,
+    compute_rolling_metrics,
+    generate_strategy_from_optimization,
+    generate_strategy_from_manual,
+    get_metric_label,
+    format_metric_value,
+    RiskAction,
 )
 
 
@@ -1184,6 +1197,361 @@ def test_emergency_recommendations_time_window():
     print("  ✅ 所有应急建议时间窗口均合理")
 
 
+def test_strategy_database():
+    print("\n=== 测试决策策略数据库 ===")
+    init_db()
+
+    tide_records = generate_default_tide_records()
+    mill_schedule = generate_default_mill_schedule()
+
+    scenario_id = create_scenario(
+        name='策略测试方案',
+        description='用于测试决策策略的方案',
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+        tide_records=tide_records,
+        mill_schedule=mill_schedule,
+    )
+    print(f"✅ 创建测试方案，ID: {scenario_id}")
+
+    strategy_id = create_strategy(
+        scenario_id=scenario_id,
+        name='测试策略A',
+        description='这是一个测试策略',
+        strategy_type='optimized',
+        optimization_target='balanced',
+        decision_reason='为了测试决策理由记录功能',
+    )
+    assert strategy_id > 0
+    print(f"✅ 创建策略成功，ID: {strategy_id}")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+    sim_results, gate_sched, _ = run_simulation(params, tide_records, mill_schedule)
+    metrics = compute_simulation_metrics(sim_results, params)
+
+    save_strategy_simulation_data(
+        strategy_id, sim_results, metrics, mill_schedule, gate_sched,
+        reservoir_capacity=100.0,
+    )
+    print("✅ 保存策略模拟数据成功")
+
+    strategy = get_strategy(strategy_id)
+    assert strategy is not None
+    assert strategy["name"] == "测试策略A"
+    assert strategy["strategy_type"] == "optimized"
+    assert strategy["decision_reason"] == "为了测试决策理由记录功能"
+    assert "metrics" in strategy
+    assert "simulation_results" in strategy
+    assert "mill_schedule" in strategy
+    assert "gate_schedule" in strategy
+    assert len(strategy["simulation_results"]) > 0
+    print("✅ 读取策略详情成功")
+
+    risk_actions = [
+        {
+            "action_type": "闸门调节",
+            "action_description": "风暴前预泄腾库",
+            "start_hour": 10.0,
+            "end_hour": 12.0,
+            "priority": "high",
+        },
+        {
+            "action_type": "设备检修",
+            "action_description": "风暴后检查设备",
+            "start_hour": 30.0,
+            "end_hour": 36.0,
+            "priority": "medium",
+        },
+    ]
+    save_strategy_risk_actions(strategy_id, risk_actions)
+    print("✅ 保存风险处置动作成功")
+
+    strategy_with_risks = get_strategy(strategy_id)
+    assert "risk_actions" in strategy_with_risks
+    assert len(strategy_with_risks["risk_actions"]) == 2
+    print(f"✅ 风险处置动作读取成功，共 {len(strategy_with_risks['risk_actions'])} 条")
+
+    strategies_list = list_strategies(scenario_id)
+    assert len(strategies_list) >= 1
+    print(f"✅ 策略列表读取成功，共 {len(strategies_list)} 个策略")
+
+    update_strategy(strategy_id, name='测试策略A-更新版', decision_reason='更新后的决策理由')
+    updated = get_strategy(strategy_id)
+    assert updated["name"] == "测试策略A-更新版"
+    assert updated["decision_reason"] == "更新后的决策理由"
+    print("✅ 策略更新成功")
+
+    strategy2_id = create_strategy(
+        scenario_id=scenario_id,
+        name='测试策略B',
+        description='第二个测试策略',
+        strategy_type='manual',
+        decision_reason='手动调度策略',
+    )
+    sim_results2, gate_sched2, _ = run_simulation(
+        params, tide_records, mill_schedule,
+        manual_gate_schedule=[{"start_hour": 0, "end_hour": 6, "open_ratio": 80}],
+    )
+    metrics2 = compute_simulation_metrics(sim_results2, params)
+    save_strategy_simulation_data(
+        strategy2_id, sim_results2, metrics2, mill_schedule, gate_sched2,
+        reservoir_capacity=100.0,
+    )
+
+    comparison = compare_strategies_metrics([strategy_id, strategy2_id])
+    assert len(comparison) == 2
+    print(f"✅ 策略指标对比成功，共 {len(comparison)} 个策略")
+
+    ts_data = get_strategy_simulation_timeseries(strategy_id)
+    assert len(ts_data) > 0
+    assert "time_hour" in ts_data[0]
+    assert "water_volume" in ts_data[0]
+    print(f"✅ 策略时序数据读取成功，共 {len(ts_data)} 条记录")
+
+    delete_strategy(strategy_id)
+    delete_strategy(strategy2_id)
+    delete_scenario(scenario_id)
+    print("✅ 清理测试数据完成")
+
+
+def test_rolling_metrics():
+    print("\n=== 测试滚动指标计算 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    results, _, _ = run_simulation(
+        params, tide_records, mill_schedule, total_hours=72.0,
+    )
+
+    rolling = compute_rolling_metrics(results, window_hours=6.0, params=params)
+
+    assert "time_hours" in rolling
+    assert "rolling_yield" in rolling
+    assert "rolling_overflow_risk" in rolling
+    assert "rolling_shortage_risk" in rolling
+    assert "rolling_shutdown_risk" in rolling
+    print("✅ 滚动指标计算返回所有必要字段")
+
+    assert len(rolling["time_hours"]) == len(results)
+    assert len(rolling["rolling_yield"]) == len(results)
+    print(f"✅ 滚动数据长度一致: {len(results)} 个时间步")
+
+    assert all(0 <= v <= 100 for v in rolling["rolling_overflow_risk"])
+    assert all(0 <= v <= 100 for v in rolling["rolling_shortage_risk"])
+    assert all(0 <= v <= 100 for v in rolling["rolling_shutdown_risk"])
+    print("✅ 所有风险值均在0-100范围内")
+
+    assert all(v >= 0 for v in rolling["rolling_yield"])
+    print("✅ 滚动产量值非负")
+
+
+def test_strategy_comparison():
+    print("\n=== 测试策略对比功能 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+
+    strategy_a = generate_strategy_from_optimization(
+        params, tide_records, target="water_saving",
+        num_days=3, daily_mill_hours=6.0,
+    )
+    strategy_b = generate_strategy_from_optimization(
+        params, tide_records, target="high_yield",
+        num_days=3, daily_mill_hours=8.0,
+    )
+
+    assert strategy_a["strategy_type"] == "optimized"
+    assert strategy_b["strategy_type"] == "optimized"
+    assert "simulation_results" in strategy_a
+    assert "metrics" in strategy_a
+    print("✅ 从优化结果生成策略数据成功")
+
+    comp_result = compare_strategies([strategy_a, strategy_b], ["节水策略", "高产策略"])
+
+    assert len(comp_result.strategy_names) == 2
+    assert "total_mill_hours" in comp_result.metrics_comparison
+    assert "overflow_volume" in comp_result.metrics_comparison
+    assert len(comp_result.overall_ranking) == 2
+    print("✅ 策略对比计算完成")
+
+    mill_hours = comp_result.metrics_comparison["total_mill_hours"]
+    assert mill_hours[1] >= mill_hours[0], "高产策略磨坊时长应不低于节水策略"
+    print("✅ 高产策略磨坊运行时长符合预期")
+
+    best_mill = comp_result.best_by_metric.get("total_mill_hours")
+    assert best_mill == "高产策略"
+    print("✅ 最佳磨坊时长策略识别正确")
+
+
+def test_timeline_analysis():
+    print("\n=== 测试时间轴分析 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+
+    strategy_a = generate_strategy_from_optimization(
+        params, tide_records, target="water_saving",
+        num_days=3, daily_mill_hours=6.0,
+    )
+    strategy_b = generate_strategy_from_optimization(
+        params, tide_records, target="high_yield",
+        num_days=3, daily_mill_hours=8.0,
+    )
+
+    timeline = build_timeline_analysis(
+        [strategy_a, strategy_b],
+        ["节水策略", "高产策略"],
+        params,
+        window_hours=6.0,
+    )
+
+    assert len(timeline.time_hours) > 0
+    print(f"✅ 时间轴分析生成，共 {len(timeline.time_hours)} 个时间点")
+
+    assert "节水策略" in timeline.water_volumes
+    assert "高产策略" in timeline.water_volumes
+    assert "节水策略" in timeline.gate_ratios
+    assert "高产策略" in timeline.gate_ratios
+    print("✅ 水量和闸门数据完整")
+
+    assert "节水策略" in timeline.rolling_yield
+    assert "高产策略" in timeline.rolling_yield
+    print("✅ 滚动产量数据完整")
+
+    assert "overflow" in timeline.rolling_risk["节水策略"]
+    assert "shortage" in timeline.rolling_risk["节水策略"]
+    assert "shutdown" in timeline.rolling_risk["节水策略"]
+    print("✅ 三项滚动风险数据完整")
+
+    assert len(timeline.water_volumes["节水策略"]) == len(timeline.time_hours)
+    print("✅ 所有数据长度与时间轴一致")
+
+
+def test_risk_action_class():
+    print("\n=== 测试风险处置动作类 ===")
+
+    action = RiskAction(
+        action_type="预泄腾库",
+        action_description="风暴来临前降低水位",
+        start_hour=24.0,
+        end_hour=30.0,
+        priority="high",
+    )
+
+    assert action.action_type == "预泄腾库"
+    assert action.start_hour == 24.0
+    assert action.end_hour == 30.0
+    assert action.priority == "high"
+    print("✅ RiskAction 类初始化成功")
+
+    action_dict = action.to_dict()
+    assert isinstance(action_dict, dict)
+    assert action_dict["action_type"] == "预泄腾库"
+    assert action_dict["start_hour"] == 24.0
+    print("✅ RiskAction 转字典成功")
+
+    action_default = RiskAction(action_type="测试", action_description="默认优先级")
+    assert action_default.priority == "medium"
+    assert action_default.start_hour is None
+    print("✅ RiskAction 默认值正确")
+
+
+def test_metric_helpers():
+    print("\n=== 测试指标辅助函数 ===")
+
+    label = get_metric_label("total_mill_hours")
+    assert label == "磨坊总运行时长"
+    print(f"✅ 磨坊总运行时长标签: {label}")
+
+    label2 = get_metric_label("overflow_volume")
+    assert label2 == "溢流水量"
+    print(f"✅ 溢流水量标签: {label2}")
+
+    label_unknown = get_metric_label("unknown_metric")
+    assert label_unknown == "unknown_metric"
+    print("✅ 未知指标返回原名称")
+
+    formatted1 = format_metric_value("total_mill_hours", 24.5)
+    assert "h" in formatted1
+    print(f"✅ 磨坊时长格式化: {formatted1}")
+
+    formatted2 = format_metric_value("overflow_volume", 15.3)
+    assert "m³" in formatted2
+    print(f"✅ 溢流水量格式化: {formatted2}")
+
+    formatted3 = format_metric_value("capacity_utilization_pct", 75.5)
+    assert "%" in formatted3
+    print(f"✅ 库容利用率格式化: {formatted3}")
+
+
+def test_manual_strategy_generation():
+    print("\n=== 测试手动策略生成 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_default_tide_records()
+    mill_schedule = generate_default_mill_schedule()
+
+    manual_gate = [
+        {"start_hour": 0.0, "end_hour": 6.0, "open_ratio": 100.0},
+        {"start_hour": 12.0, "end_hour": 18.0, "open_ratio": 50.0},
+    ]
+
+    strategy = generate_strategy_from_manual(
+        params, tide_records, mill_schedule,
+        manual_gate_schedule=manual_gate,
+    )
+
+    assert strategy["strategy_type"] == "manual"
+    assert "simulation_results" in strategy
+    assert "metrics" in strategy
+    assert "mill_schedule" in strategy
+    assert "gate_schedule" in strategy
+    print("✅ 手动策略生成成功")
+
+    assert len(strategy["simulation_results"]) > 0
+    assert len(strategy["metrics"]) > 0
+    print("✅ 手动策略包含模拟结果和指标")
+
+
 def main():
     print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v4")
     print("=" * 60)
@@ -1216,6 +1584,13 @@ def main():
         test_disturbance_time_window()
         test_monte_carlo_simulation()
         test_emergency_recommendations_time_window()
+        test_strategy_database()
+        test_rolling_metrics()
+        test_strategy_comparison()
+        test_timeline_analysis()
+        test_risk_action_class()
+        test_metric_helpers()
+        test_manual_strategy_generation()
 
         print("\n" + "=" * 60)
         print("🎉 所有测试通过! 系统运行正常。")
