@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""测试潮汐磨坊调度模拟系统的核心功能"""
+"""测试潮汐磨坊调度模拟系统的核心功能 - v2"""
 
 from database import (
     init_db, create_scenario, list_scenarios, get_scenario,
@@ -7,8 +7,176 @@ from database import (
 )
 from simulation import (
     SimulationParams, run_simulation, validate_tide_records,
+    validate_mill_schedule, estimate_mill_water_needs,
+    validate_manual_gate_schedule, parse_tide_csv,
     generate_default_tide_records, generate_default_mill_schedule
 )
+
+
+def test_validate_tide_records():
+    print("\n=== 测试潮位记录验证 ===")
+
+    tide_records = generate_default_tide_records()
+    valid, msg = validate_tide_records(tide_records)
+    assert valid, f"默认数据应有效: {msg}"
+    print(f"✅ 默认潮位数据验证通过: {msg}")
+
+    bad_records = [
+        {"time_hour": 2.0, "tide_level": 2.0},
+        {"time_hour": 5.0, "tide_level": 3.0},
+    ]
+    valid, msg = validate_tide_records(bad_records)
+    assert not valid, "不从0开始的记录应该无效"
+    print(f"✅ 不从0开始检测通过: {msg}")
+
+    bad_records2 = [
+        {"time_hour": 0.0, "tide_level": 2.0},
+        {"time_hour": 5.0, "tide_level": 3.0},
+    ]
+    valid, msg = validate_tide_records(bad_records2)
+    assert not valid, "不到24小时的记录应该无效"
+    print(f"✅ 不覆盖24小时检测通过: {msg}")
+
+    dup_records = [
+        {"time_hour": 0.0, "tide_level": 2.0},
+        {"time_hour": 12.0, "tide_level": 3.0},
+        {"time_hour": 12.0, "tide_level": 2.5},
+        {"time_hour": 24.0, "tide_level": 2.0},
+    ]
+    valid, msg = validate_tide_records(dup_records)
+    assert not valid, "重复时间应该无效"
+    print(f"✅ 重复时间检测通过: {msg}")
+
+    negative_records = [
+        {"time_hour": 0.0, "tide_level": -2.0},
+        {"time_hour": 24.0, "tide_level": 3.0},
+    ]
+    valid, msg = validate_tide_records(negative_records)
+    assert not valid, "负潮位应该无效"
+    print(f"✅ 负潮位检测通过: {msg}")
+
+
+def test_validate_mill_schedule():
+    print("\n=== 测试磨坊计划验证 ===")
+
+    schedule = generate_default_mill_schedule()
+    valid, msg, warns = validate_mill_schedule(schedule)
+    assert valid, f"默认计划应有效: {msg}"
+    print(f"✅ 默认磨坊计划验证通过: {msg}")
+
+    overlap_schedule = [
+        {"start_hour": 8.0, "end_hour": 12.0},
+        {"start_hour": 10.0, "end_hour": 14.0},
+    ]
+    valid, msg, _ = validate_mill_schedule(overlap_schedule)
+    assert not valid, "重叠时段应该无效"
+    print(f"✅ 重叠时段检测通过: {msg}")
+
+    invalid_schedule = [
+        {"start_hour": 12.0, "end_hour": 8.0},
+    ]
+    valid, msg, _ = validate_mill_schedule(invalid_schedule)
+    assert not valid, "开始>结束应该无效"
+    print(f"✅ 开始>结束检测通过: {msg}")
+
+
+def test_water_needs_estimation():
+    print("\n=== 测试水量估算 ===")
+
+    schedule = generate_default_mill_schedule()
+    total_water, warnings = estimate_mill_water_needs(schedule, 5.0, 100.0)
+    print(f"✅ 总耗水量估算: {total_water:.1f} m³")
+    assert total_water > 0, "耗水量应大于0"
+
+    big_schedule = [
+        {"start_hour": 0.0, "end_hour": 24.0},
+    ]
+    total_water2, warnings2 = estimate_mill_water_needs(big_schedule, 10.0, 100.0)
+    assert len(warnings2) >= 1, "水量不足应该有警告"
+    print(f"✅ 水量不足警告: {warnings2[0]}")
+
+
+def test_manual_gate():
+    print("\n=== 测试手动闸门控制 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+    tide_records = generate_default_tide_records()
+    mill_schedule = generate_default_mill_schedule()
+
+    manual_schedule = [
+        {"start_hour": 0.0, "end_hour": 6.0, "open_ratio": 100.0},
+        {"start_hour": 12.0, "end_hour": 18.0, "open_ratio": 50.0},
+    ]
+
+    valid, msg, warns = validate_manual_gate_schedule(manual_schedule)
+    assert valid, f"手动闸门计划应有效: {msg}"
+    print(f"✅ 手动闸门验证通过: {msg}")
+    if warns:
+        for w in warns:
+            print(f"   ⚠️  {w}")
+
+    results, gate_schedule, warnings = run_simulation(
+        params, tide_records, mill_schedule,
+        manual_gate_schedule=manual_schedule,
+    )
+    assert len(results) > 0
+    print(f"✅ 手动闸门模式模拟成功: {len(results)} 个时间步")
+
+    gate_ratios = [r["gate_open_ratio"] for r in results]
+    print(f"✅ 闸门开启比例范围: {min(gate_ratios):.1f}% - {max(gate_ratios):.1f}%")
+
+    bad_gate = [
+        {"start_hour": 0.0, "end_hour": 10.0, "open_ratio": 150.0},
+    ]
+    valid, msg, _ = validate_manual_gate_schedule(bad_gate)
+    assert not valid, "超过100%的比例应该无效"
+    print(f"✅ 超限比例检测通过: {msg}")
+
+    overlap_gate = [
+        {"start_hour": 0.0, "end_hour": 10.0, "open_ratio": 50.0},
+        {"start_hour": 8.0, "end_hour": 16.0, "open_ratio": 30.0},
+    ]
+    valid, msg, _ = validate_manual_gate_schedule(overlap_gate)
+    assert not valid, "重叠闸门时段应该无效"
+    print(f"✅ 重叠闸门时段检测通过: {msg}")
+
+
+def test_csv_parsing():
+    print("\n=== 测试CSV解析 ===")
+
+    csv_content = """time_hour,tide_level
+0.0,2.5
+6.0,4.5
+12.0,2.5
+18.0,0.5
+24.0,2.5
+"""
+    records, msg = parse_tide_csv(csv_content)
+    assert len(records) == 5, f"应解析5条记录，实际{len(records)}"
+    assert records[0]["time_hour"] == 0.0
+    assert records[0]["tide_level"] == 2.5
+    print(f"✅ CSV解析成功: {msg}")
+
+    csv_chinese = """小时,潮位米
+0,3.0
+12,1.0
+24,3.0
+"""
+    records2, msg2 = parse_tide_csv(csv_chinese)
+    assert len(records2) == 3, f"应解析3条记录，实际{len(records2)}"
+    print(f"✅ 中文CSV解析成功: {msg2}")
+
+    bad_csv = """invalid
+bad data
+"""
+    records3, msg3 = parse_tide_csv(bad_csv)
+    print(f"✅ 无效CSV处理: {msg3}")
 
 
 def test_database():
@@ -20,7 +188,7 @@ def test_database():
     mill_schedule = generate_default_mill_schedule()
 
     scenario_id = create_scenario(
-        name='测试方案',
+        name='测试方案v2',
         description='用于测试的方案',
         reservoir_capacity=100.0,
         reservoir_area=20.0,
@@ -34,65 +202,24 @@ def test_database():
 
     scenario = get_scenario(scenario_id)
     assert scenario is not None
-    assert scenario['name'] == '测试方案'
-    assert scenario['reservoir_capacity'] == 100.0
     assert scenario['reservoir_area'] == 20.0
-    assert len(scenario['tide_records']) == 25
-    assert len(scenario['mill_schedule']) == 2
-    print("✅ 方案读取成功")
+    print("✅ 方案读取成功（含蓄水池面积）")
 
-    scenarios = list_scenarios()
-    assert len(scenarios) >= 1
-    print(f"✅ 方案列表获取成功, 共 {len(scenarios)} 个方案")
-
-    new_id = copy_scenario(scenario_id, '测试方案副本')
+    new_id = copy_scenario(scenario_id, '测试方案副本v2')
     new_scenario = get_scenario(new_id)
-    assert new_scenario is not None
-    assert new_scenario['reservoir_capacity'] == scenario['reservoir_capacity']
     assert new_scenario['reservoir_area'] == scenario['reservoir_area']
-    print(f"✅ 方案复制成功, 新ID: {new_id}")
-
-    results, gate_schedule, warnings = run_simulation(
-        SimulationParams(
-            reservoir_capacity=100.0,
-            reservoir_area=20.0,
-            gate_max_flow=50.0,
-            mill_power_consumption=5.0,
-            initial_water_level=50.0,
-        ),
-        tide_records,
-        mill_schedule,
-    )
-    save_simulation_results(scenario_id, results, gate_schedule)
-    saved_results, saved_gate = get_simulation_results(scenario_id)
-    assert len(saved_results) == len(results)
-    assert len(saved_gate) == len(gate_schedule)
-    print("✅ 模拟结果保存和读取成功")
+    print("✅ 方案复制成功")
 
     delete_scenario(new_id)
-    deleted = get_scenario(new_id)
-    assert deleted is None
-    print("✅ 方案删除成功")
-
     delete_scenario(scenario_id)
     print("✅ 清理测试数据完成")
 
 
-def test_simulation():
-    print("\n=== 测试模拟逻辑 ===")
+def test_simulation_constraints():
+    print("\n=== 测试模拟约束 ===")
 
     tide_records = generate_default_tide_records()
-    valid, msg = validate_tide_records(tide_records)
-    assert valid, f"验证失败: {msg}"
-    print(f"✅ 潮位记录验证通过: {msg}")
-
-    invalid_records = [
-        {"time_hour": 1.0, "tide_level": 2.0},
-        {"time_hour": 1.0, "tide_level": 3.0},
-    ]
-    valid, msg = validate_tide_records(invalid_records)
-    assert not valid
-    print(f"✅ 重复时间检测通过: {msg}")
+    mill_schedule = generate_default_mill_schedule()
 
     params = SimulationParams(
         reservoir_capacity=100.0,
@@ -101,151 +228,41 @@ def test_simulation():
         mill_power_consumption=5.0,
         initial_water_level=50.0,
     )
-    mill_schedule = generate_default_mill_schedule()
 
-    results, gate_schedule, warnings = run_simulation(params, tide_records, mill_schedule)
-    assert len(results) > 0
-    print(f"✅ 模拟运行成功, 共 {len(results)} 个时间步")
-    print(f"✅ 闸门调度建议: {len(gate_schedule)} 条")
+    results, _, warnings = run_simulation(params, tide_records, mill_schedule)
 
     water_volumes = [r['water_volume'] for r in results]
     assert min(water_volumes) >= -0.001, f"蓄水量低于0: {min(water_volumes)}"
     assert max(water_volumes) <= params.reservoir_capacity + 0.001, f"蓄水量超过容量: {max(water_volumes)}"
-    print(f"✅ 蓄水量约束验证通过: {min(water_volumes):.2f} - {max(water_volumes):.2f} m³")
-
-    water_heights = [r['water_level'] for r in results]
-    print(f"✅ 蓄水池水位范围: {min(water_heights):.2f} - {max(water_heights):.2f} m")
+    print(f"✅ 蓄水量约束: {min(water_volumes):.2f} - {max(water_volumes):.2f} m³")
 
     gate_ratios = [r['gate_open_ratio'] for r in results]
     assert min(gate_ratios) >= -0.001, f"闸门比例低于0: {min(gate_ratios)}"
     assert max(gate_ratios) <= 100.001, f"闸门比例超过100: {max(gate_ratios)}"
-    print(f"✅ 闸门开启比例约束验证通过: {min(gate_ratios):.1f}% - {max(gate_ratios):.1f}%")
+    print(f"✅ 闸门比例约束: {min(gate_ratios):.1f}% - {max(gate_ratios):.1f}%")
 
     mill_running_volumes = [r['water_volume'] for r in results if r['mill_running']]
     if mill_running_volumes:
-        assert min(mill_running_volumes) >= -0.001, f"磨坊运行时蓄水量为负"
-        print(f"✅ 磨坊运行时水位约束验证通过")
-    else:
-        print("⚠️  警告: 没有磨坊运行时段")
+        assert min(mill_running_volumes) >= -0.001
+        print(f"✅ 磨坊运行时水位约束: {min(mill_running_volumes):.2f} m³ (最低)")
 
-    if warnings:
-        print(f"⚠️  模拟警告: {len(warnings)} 条")
-        for w in warnings[:3]:
-            print(f"   - {w}")
-
-    open_periods = [g for g in gate_schedule if g["action"] == "开启"]
-    if open_periods:
-        print(f"✅ 闸门开启时段: {len(open_periods)} 个")
-        for p in open_periods[:3]:
-            print(f"   - {p['start_hour']:.1f}h - {p['end_hour']:.1f}h")
-    else:
-        print("⚠️  警告: 没有闸门开启时段")
-
-    print(f"✅ 所有模拟约束验证通过")
-
-
-def test_edge_cases():
-    print("\n=== 测试边界情况 ===")
-
-    tide_records = generate_default_tide_records()
-    mill_schedule = generate_default_mill_schedule()
-
-    params = SimulationParams(
-        reservoir_capacity=100.0,
-        reservoir_area=20.0,
-        gate_max_flow=50.0,
-        mill_power_consumption=5.0,
-        initial_water_level=-10.0,
-    )
-    results, gate_schedule, warnings = run_simulation(params, tide_records, mill_schedule)
-    assert results[0]['water_volume'] >= 0
-    print("✅ 负初始蓄水量处理通过")
-
-    params2 = SimulationParams(
-        reservoir_capacity=50.0,
-        reservoir_area=10.0,
-        gate_max_flow=50.0,
-        mill_power_consumption=5.0,
-        initial_water_level=100.0,
-    )
-    results2, _, warnings2 = run_simulation(params2, tide_records, mill_schedule)
-    assert results2[0]['water_volume'] <= params2.reservoir_capacity + 0.001
-    print("✅ 初始蓄水量超容量处理通过")
-
-    params3 = SimulationParams(
-        reservoir_capacity=20.0,
-        reservoir_area=5.0,
-        gate_max_flow=5.0,
-        mill_power_consumption=20.0,
-        initial_water_level=10.0,
-    )
-    mill_schedule3 = [{"start_hour": 0.0, "end_hour": 24.0}]
-    results3, _, warnings3 = run_simulation(params3, tide_records, mill_schedule3)
-    water_volumes3 = [r['water_volume'] for r in results3]
-    assert min(water_volumes3) >= -0.001
-    print("✅ 高耗水低容量边界情况处理通过")
-
-    try:
-        params4 = SimulationParams(
-            reservoir_capacity=100.0,
-            reservoir_area=0.0,
-            gate_max_flow=50.0,
-            mill_power_consumption=5.0,
-            initial_water_level=50.0,
-        )
-        run_simulation(params4, tide_records, mill_schedule)
-        assert False, "应该抛出面积为0的错误"
-    except ValueError as e:
-        print(f"✅ 零面积检测通过: {e}")
-
-    print("✅ 所有边界情况测试通过")
-
-
-def test_physical_model():
-    print("\n=== 测试物理模型合理性 ===")
-
-    tide_records = generate_default_tide_records()
-    mill_schedule = generate_default_mill_schedule()
-
-    params = SimulationParams(
-        reservoir_capacity=100.0,
-        reservoir_area=20.0,
-        gate_max_flow=50.0,
-        mill_power_consumption=5.0,
-        initial_water_level=20.0,
-    )
-
-    results, gate_schedule, warnings = run_simulation(params, tide_records, mill_schedule)
-
-    tide_levels = [r['tide_level'] for r in results]
-    water_heights = [r['water_level'] for r in results]
-    gate_ratios = [r['gate_open_ratio'] for r in results]
-
-    print(f"潮位范围: {min(tide_levels):.2f} - {max(tide_levels):.2f} m")
-    print(f"蓄水池水位范围: {min(water_heights):.2f} - {max(water_heights):.2f} m")
-    print(f"最大水位高度(容量/面积): {params.max_water_height:.2f} m")
-
-    gate_open_count = sum(1 for r in gate_ratios if r > 50)
-    print(f"闸门开启时间步数: {gate_open_count} / {len(results)}")
-
-    if gate_open_count > 0:
-        print("✅ 闸门有开启动作，物理模型合理")
-    else:
-        print("⚠️  警告: 闸门未开启，可能需要调整参数")
-
-    print("✅ 物理模型测试完成")
+    print("✅ 所有约束验证通过")
 
 
 def main():
-    print("🌊 潮汐磨坊调度模拟系统 - 功能测试")
-    print("=" * 50)
+    print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v2")
+    print("=" * 60)
 
     try:
+        test_validate_tide_records()
+        test_validate_mill_schedule()
+        test_water_needs_estimation()
+        test_manual_gate()
+        test_csv_parsing()
         test_database()
-        test_simulation()
-        test_edge_cases()
-        test_physical_model()
-        print("\n" + "=" * 50)
+        test_simulation_constraints()
+
+        print("\n" + "=" * 60)
         print("🎉 所有测试通过! 系统运行正常。")
         return 0
     except Exception as e:

@@ -19,6 +19,10 @@ from simulation import (
     SimulationParams,
     run_simulation,
     validate_tide_records,
+    validate_mill_schedule,
+    validate_manual_gate_schedule,
+    estimate_mill_water_needs,
+    parse_tide_csv,
     generate_default_tide_records,
     generate_default_mill_schedule,
 )
@@ -289,8 +293,103 @@ with tab1:
         tide_records = st.session_state.get("tide_records", generate_default_tide_records())
         mill_schedule = st.session_state.get("mill_schedule", generate_default_mill_schedule())
 
+        if "gate_mode" not in st.session_state:
+            st.session_state["gate_mode"] = "auto"
+        if "manual_gate_schedule" not in st.session_state:
+            st.session_state["manual_gate_schedule"] = []
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            gate_mode = st.radio(
+                "闸门控制模式",
+                options=["auto", "manual"],
+                format_func=lambda x: "🤖 自动调度" if x == "auto" else "✋ 手动控制",
+                horizontal=True,
+                key="gate_mode_radio",
+            )
+        with col2:
+            st.write("")
+            st.caption(
+                "自动模式：系统根据潮位和蓄水量智能开关闸门 | "
+                "手动模式：由您手动设置每个时段的闸门开启比例"
+            )
+
+        manual_gate = None
+        if gate_mode == "manual":
+            st.info("💡 手动设置闸门开启时段和比例。未设置的时段闸门默认关闭。")
+
+            gate_df = pd.DataFrame(
+                st.session_state["manual_gate_schedule"],
+                columns=["start_hour", "end_hour", "open_ratio"],
+            )
+
+            edited_gate_df = st.data_editor(
+                gate_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "start_hour": st.column_config.NumberColumn(
+                        "开始时间 (小时)",
+                        min_value=0,
+                        max_value=24,
+                        step=0.5,
+                        format="%.1f",
+                    ),
+                    "end_hour": st.column_config.NumberColumn(
+                        "结束时间 (小时)",
+                        min_value=0,
+                        max_value=24,
+                        step=0.5,
+                        format="%.1f",
+                    ),
+                    "open_ratio": st.column_config.NumberColumn(
+                        "开启比例 (%)",
+                        min_value=0,
+                        max_value=100,
+                        step=5,
+                        format="%.0f",
+                    ),
+                },
+            )
+
+            preview_gate = edited_gate_df.to_dict("records")
+            if preview_gate:
+                valid_gate, gate_msg, gate_warns = validate_manual_gate_schedule(preview_gate)
+                if not valid_gate:
+                    st.error(f"❌ {gate_msg}")
+                else:
+                    if gate_warns:
+                        for w in gate_warns:
+                            st.warning(f"⚠️ {w}")
+                    st.success("✅ 手动闸门计划有效")
+
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                if st.button("✅ 更新手动闸门设置", use_container_width=True):
+                    schedule = edited_gate_df.to_dict("records")
+                    valid, msg, _ = validate_manual_gate_schedule(schedule)
+                    if not valid:
+                        st.error(msg)
+                    else:
+                        st.session_state["manual_gate_schedule"] = schedule
+                        st.session_state["needs_simulation"] = True
+                        st.success("手动闸门设置已更新")
+                        st.rerun()
+            with col_g2:
+                if st.button("🔄 清空闸门设置", use_container_width=True):
+                    st.session_state["manual_gate_schedule"] = []
+                    st.session_state["needs_simulation"] = True
+                    st.rerun()
+
+            manual_gate = st.session_state["manual_gate_schedule"]
+
+        if gate_mode != st.session_state.get("gate_mode"):
+            st.session_state["gate_mode"] = gate_mode
+            st.session_state["needs_simulation"] = True
+
         results, gate_schedule, warnings = run_simulation(
-            params, tide_records, mill_schedule
+            params, tide_records, mill_schedule,
+            manual_gate_schedule=manual_gate,
         )
 
         if st.session_state.get("scenario_id") and st.session_state.get("needs_simulation", True):
@@ -478,10 +577,39 @@ with tab1:
 with tab2:
     st.header("🌊 潮位数据管理")
 
-    st.info("录入每日潮位时间序列数据。时间必须连续，单位为小时（0-24）。")
+    st.info("录入每日潮位时间序列数据。时间必须连续（从0到24小时），单位为小时。支持CSV文件上传。")
 
     if "tide_records" not in st.session_state:
         st.session_state["tide_records"] = generate_default_tide_records()
+
+    uploaded_file = st.file_uploader(
+        "📁 上传潮位 CSV 文件",
+        type=["csv"],
+        help="CSV文件应包含时间（小时）和潮位（米）两列，自动识别列名",
+    )
+
+    if uploaded_file is not None:
+        try:
+            csv_content = uploaded_file.getvalue().decode("utf-8")
+            records, msg = parse_tide_csv(csv_content)
+            if records:
+                valid, valid_msg = validate_tide_records(records)
+                if valid:
+                    st.success(f"✅ {msg}")
+                    if st.button("📥 导入此数据", use_container_width=True):
+                        st.session_state["tide_records"] = records
+                        st.session_state["needs_simulation"] = True
+                        st.success("潮位数据已导入")
+                        st.rerun()
+                else:
+                    st.error(f"❌ 数据验证失败: {valid_msg}")
+                    st.write(f"解析到 {len(records)} 条记录")
+            else:
+                st.error(f"❌ {msg}")
+        except Exception as e:
+            st.error(f"文件读取失败: {e}")
+
+    st.divider()
 
     tide_df = pd.DataFrame(st.session_state["tide_records"])
     if "time_index" in tide_df.columns:
@@ -508,6 +636,14 @@ with tab2:
             ),
         },
     )
+
+    preview_records = edited_df.to_dict("records")
+    if preview_records:
+        valid, msg = validate_tide_records(preview_records)
+        if not valid:
+            st.error(f"❌ {msg}")
+        else:
+            st.success(f"✅ {msg}")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -552,7 +688,7 @@ with tab2:
 with tab3:
     st.header("⚙️ 磨坊运行计划")
 
-    st.info("设置计划的磨粉时段。水位不足时，磨坊将无法运行。")
+    st.info("设置计划的磨粉时段。水位不足时，磨坊将无法运行。系统会检测时段重叠和水量风险。")
 
     if "mill_schedule" not in st.session_state:
         st.session_state["mill_schedule"] = generate_default_mill_schedule()
@@ -581,20 +717,28 @@ with tab3:
         },
     )
 
+    preview_schedule = edited_mill_df.to_dict("records")
+    if preview_schedule:
+        valid, msg, warn_list = validate_mill_schedule(preview_schedule)
+        if not valid:
+            st.error(f"❌ {msg}")
+        elif warn_list:
+            for w in warn_list:
+                st.warning(f"⚠️ {w}")
+
+        total_water, water_warnings = estimate_mill_water_needs(
+            preview_schedule,
+            st.session_state.get("mill_power_consumption", 5.0),
+            st.session_state.get("reservoir_capacity", 100.0),
+        )
+        if water_warnings:
+            for w in water_warnings:
+                st.warning(f"💧 {w}")
+        st.info(f"📊 预计总耗水量: {total_water:.1f} m³")
+
     if st.button("✅ 更新磨坊计划", use_container_width=True):
         schedule = edited_mill_df.to_dict("records")
-        valid = True
-        msg = ""
-        for i, s in enumerate(schedule):
-            if s["start_hour"] >= s["end_hour"]:
-                valid = False
-                msg = f"第 {i+1} 个时段的开始时间必须小于结束时间"
-                break
-            if s["start_hour"] < 0 or s["end_hour"] > 24:
-                valid = False
-                msg = f"第 {i+1} 个时段的时间必须在 0-24 小时范围内"
-                break
-
+        valid, msg, _ = validate_mill_schedule(schedule)
         if not valid:
             st.error(msg)
         else:

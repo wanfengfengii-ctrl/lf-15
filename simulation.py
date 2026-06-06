@@ -44,7 +44,58 @@ def validate_tide_records(tide_records: List[Dict], total_hours: float = 24.0) -
         if sorted_records[i]["time_hour"] == sorted_records[i + 1]["time_hour"]:
             return False, f"存在重复的时间点: {sorted_records[i]['time_hour']}"
 
+    if sorted_records[0]["time_hour"] > 0.01:
+        return False, f"潮位记录必须从0小时开始，当前起始时间: {sorted_records[0]['time_hour']} 小时"
+
+    if sorted_records[-1]["time_hour"] < total_hours - 0.01:
+        return False, f"潮位记录必须覆盖到 {total_hours} 小时，当前结束时间: {sorted_records[-1]['time_hour']} 小时"
+
     return True, "潮位记录有效"
+
+
+def validate_mill_schedule(mill_schedule: List[Dict], total_hours: float = 24.0) -> Tuple[bool, str, List[str]]:
+    warnings = []
+
+    if not mill_schedule:
+        return True, "磨坊计划有效", warnings
+
+    sorted_schedule = sorted(mill_schedule, key=lambda s: s["start_hour"])
+
+    for i, sched in enumerate(sorted_schedule):
+        if sched["start_hour"] < 0 or sched["start_hour"] > total_hours:
+            return False, f"第 {i+1} 个时段的开始时间 {sched['start_hour']} 超出范围 [0, {total_hours}]", warnings
+        if sched["end_hour"] < 0 or sched["end_hour"] > total_hours:
+            return False, f"第 {i+1} 个时段的结束时间 {sched['end_hour']} 超出范围 [0, {total_hours}]", warnings
+        if sched["start_hour"] >= sched["end_hour"]:
+            return False, f"第 {i+1} 个时段的开始时间必须小于结束时间", warnings
+
+    for i in range(len(sorted_schedule) - 1):
+        if sorted_schedule[i]["end_hour"] > sorted_schedule[i + 1]["start_hour"] + 0.001:
+            return False, f"时段 {i+1} 与时段 {i+2} 重叠: {sorted_schedule[i]['end_hour']} > {sorted_schedule[i+1]['start_hour']}", warnings
+
+    return True, "磨坊计划有效", warnings
+
+
+def estimate_mill_water_needs(
+    mill_schedule: List[Dict],
+    mill_power_consumption: float,
+    reservoir_capacity: float,
+) -> Tuple[float, List[str]]:
+    warnings = []
+
+    total_hours = sum(s["end_hour"] - s["start_hour"] for s in mill_schedule)
+    total_water_needed = total_hours * mill_power_consumption
+
+    if total_water_needed > reservoir_capacity:
+        warnings.append(
+            f"磨坊总需水量 {total_water_needed:.1f} m³ 超过蓄水池容量 {reservoir_capacity:.1f} m³，"
+            f"需要依靠潮汐补水才能完成磨粉"
+        )
+
+    if total_hours > 12:
+        warnings.append(f"磨坊计划运行 {total_hours:.1f} 小时，时间较长，需确保有足够的潮汐周期补水")
+
+    return total_water_needed, warnings
 
 
 def interpolate_tide(
@@ -151,13 +202,114 @@ def generate_gate_schedule(
     return schedule
 
 
+def parse_tide_csv(csv_content: str) -> Tuple[List[Dict], str]:
+    import csv
+    import io
+
+    records = []
+    try:
+        reader = csv.DictReader(io.StringIO(csv_content))
+        fieldnames = reader.fieldnames
+
+        time_col = None
+        level_col = None
+
+        for name in fieldnames:
+            name_lower = name.lower().strip()
+            if time_col is None and ("time" in name_lower or "小时" in name or "时间" in name or "hour" in name_lower):
+                time_col = name
+            if level_col is None and ("level" in name_lower or "tide" in name_lower or "潮位" in name or "水位" in name):
+                level_col = name
+
+        if time_col is None and len(fieldnames) >= 1:
+            time_col = fieldnames[0]
+        if level_col is None and len(fieldnames) >= 2:
+            level_col = fieldnames[1]
+
+        if time_col is None or level_col is None:
+            return [], "CSV 文件格式不正确，需要包含时间和潮位列"
+
+        for i, row in enumerate(reader):
+            try:
+                time_hour = float(row[time_col].strip())
+                tide_level = float(row[level_col].strip())
+                records.append({"time_hour": time_hour, "tide_level": tide_level})
+            except (ValueError, KeyError) as e:
+                return [], f"第 {i+2} 行数据解析失败: {e}"
+
+        if not records:
+            return [], "CSV 文件中没有有效数据"
+
+        return records, f"成功解析 {len(records)} 条潮位记录"
+
+    except Exception as e:
+        return [], f"CSV 解析失败: {str(e)}"
+
+
+def validate_manual_gate_schedule(
+    gate_schedule: List[Dict],
+    total_hours: float = 24.0,
+) -> Tuple[bool, str, List[str]]:
+    warnings = []
+
+    if not gate_schedule:
+        return True, "手动闸门计划有效（空）", warnings
+
+    sorted_schedule = sorted(gate_schedule, key=lambda s: s["start_hour"])
+
+    for i, sched in enumerate(sorted_schedule):
+        if "start_hour" not in sched or "end_hour" not in sched or "open_ratio" not in sched:
+            return False, f"第 {i+1} 条闸门记录格式不正确", warnings
+
+        if sched["start_hour"] < 0 or sched["start_hour"] > total_hours:
+            return False, f"第 {i+1} 条记录的开始时间 {sched['start_hour']} 超出范围 [0, {total_hours}]", warnings
+        if sched["end_hour"] < 0 or sched["end_hour"] > total_hours:
+            return False, f"第 {i+1} 条记录的结束时间 {sched['end_hour']} 超出范围 [0, {total_hours}]", warnings
+        if sched["start_hour"] >= sched["end_hour"]:
+            return False, f"第 {i+1} 条记录的开始时间必须小于结束时间", warnings
+        if sched["open_ratio"] < 0 or sched["open_ratio"] > 100:
+            return False, f"第 {i+1} 条记录的开启比例 {sched['open_ratio']}% 超出范围 [0, 100]", warnings
+
+    for i in range(len(sorted_schedule) - 1):
+        if sorted_schedule[i]["end_hour"] > sorted_schedule[i + 1]["start_hour"] + 0.001:
+            return False, f"闸门时段 {i+1} 与 {i+2} 重叠", warnings
+
+    if sorted_schedule[0]["start_hour"] > 0.01:
+        warnings.append(f"0:00 - {sorted_schedule[0]['start_hour']}:00 闸门未设置，默认关闭")
+
+    if sorted_schedule[-1]["end_hour"] < total_hours - 0.01:
+        warnings.append(f"{sorted_schedule[-1]['end_hour']}:00 - {total_hours}:00 闸门未设置，默认关闭")
+
+    return True, "手动闸门计划有效", warnings
+
+
+def get_gate_ratio_at_time(
+    manual_schedule: List[Dict],
+    time_hour: float,
+    default_ratio: float = 0.0,
+) -> float:
+    for sched in manual_schedule:
+        if sched["start_hour"] <= time_hour < sched["end_hour"]:
+            return sched["open_ratio"]
+    return default_ratio
+
+
 def run_simulation(
     params: SimulationParams,
     tide_records: List[Dict],
     mill_schedule: List[Dict],
     total_hours: float = 24.0,
+    manual_gate_schedule: List[Dict] = None,
 ) -> Tuple[List[Dict], List[Dict], List[str]]:
     warnings = []
+
+    use_manual_gate = manual_gate_schedule is not None and len(manual_gate_schedule) > 0
+
+    if use_manual_gate:
+        valid, msg, gate_warnings = validate_manual_gate_schedule(manual_gate_schedule, total_hours)
+        if not valid:
+            raise ValueError(msg)
+        warnings.extend(gate_warnings)
 
     if params.initial_water_level < 0:
         warnings.append("初始蓄水量不能为负，已设为0")
@@ -191,24 +343,27 @@ def run_simulation(
 
         mill_running = is_mill_running(mill_schedule, t)
 
-        target_gate_ratio = 0.0
-
-        if mill_running:
-            if prev_volume > params.reservoir_capacity * 0.4:
-                target_gate_ratio = 0.0
-            elif tide_level > prev_height and prev_volume < params.reservoir_capacity * 0.95:
-                target_gate_ratio = 100.0
-            else:
-                target_gate_ratio = 0.0
+        if use_manual_gate:
+            gate_ratio = get_gate_ratio_at_time(manual_gate_schedule, t, 0.0)
         else:
-            if tide_level > prev_height and prev_volume < params.reservoir_capacity * 0.95:
-                target_gate_ratio = 100.0
-            elif tide_level < prev_height and prev_volume > params.reservoir_capacity * 0.1:
-                target_gate_ratio = 0.0
-            else:
-                target_gate_ratio = 0.0
+            target_gate_ratio = 0.0
 
-        gate_ratio = max(0.0, min(100.0, target_gate_ratio))
+            if mill_running:
+                if prev_volume > params.reservoir_capacity * 0.4:
+                    target_gate_ratio = 0.0
+                elif tide_level > prev_height and prev_volume < params.reservoir_capacity * 0.95:
+                    target_gate_ratio = 100.0
+                else:
+                    target_gate_ratio = 0.0
+            else:
+                if tide_level > prev_height and prev_volume < params.reservoir_capacity * 0.95:
+                    target_gate_ratio = 100.0
+                elif tide_level < prev_height and prev_volume > params.reservoir_capacity * 0.1:
+                    target_gate_ratio = 0.0
+                else:
+                    target_gate_ratio = 0.0
+
+            gate_ratio = max(0.0, min(100.0, target_gate_ratio))
 
         flow_rate = calculate_gate_flow(
             tide_level, prev_height, gate_ratio, params.gate_max_flow
