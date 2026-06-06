@@ -449,7 +449,11 @@ def generate_multi_day_tide_records(num_days: int = 7, base_level: float = 2.5, 
     return records
 
 
-def validate_multi_day_tide_records(tide_records: List[Dict], min_hours: float = 24.0) -> Tuple[bool, str]:
+def validate_multi_day_tide_records(
+    tide_records: List[Dict],
+    min_hours: float = 24.0,
+    max_gap_hours: float = 6.0,
+) -> Tuple[bool, str]:
     if not tide_records:
         return False, "潮位记录不能为空"
 
@@ -470,6 +474,14 @@ def validate_multi_day_tide_records(tide_records: List[Dict], min_hours: float =
         if sorted_records[i]["time_hour"] == sorted_records[i + 1]["time_hour"]:
             return False, f"存在重复的时间点: {sorted_records[i]['time_hour']}"
 
+    for i in range(len(sorted_records) - 1):
+        gap = sorted_records[i + 1]["time_hour"] - sorted_records[i]["time_hour"]
+        if gap > max_gap_hours + 0.01:
+            return False, (
+                f"第 {i+1} 条与第 {i+2} 条记录之间的时间间隔为 {gap:.1f} 小时，"
+                f"超过最大允许间隔 {max_gap_hours:.1f} 小时，数据不连续"
+            )
+
     total_span = sorted_records[-1]["time_hour"] - sorted_records[0]["time_hour"]
     if total_span < min_hours - 0.01:
         return False, f"潮位记录覆盖时长不足 {min_hours} 小时，当前仅 {total_span:.1f} 小时"
@@ -477,7 +489,7 @@ def validate_multi_day_tide_records(tide_records: List[Dict], min_hours: float =
     if sorted_records[0]["time_hour"] > 0.01:
         return False, f"潮位记录必须从0小时开始，当前起始时间: {sorted_records[0]['time_hour']} 小时"
 
-    return True, f"潮位记录有效，覆盖 {total_span:.1f} 小时 ({total_span/24:.1f} 天)"
+    return True, f"潮位记录有效，覆盖 {total_span:.1f} 小时 ({total_span/24:.2f} 天)，共 {len(tide_records)} 条记录"
 
 
 def get_total_hours(tide_records: List[Dict]) -> float:

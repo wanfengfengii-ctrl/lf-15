@@ -281,6 +281,37 @@ def test_multi_day_tide():
     assert not valid, "不足24小时的数据应无效"
     print(f"✅ 不足时长检测通过: {msg}")
 
+    discontinuous_records = [
+        {"time_hour": 0.0, "tide_level": 2.0},
+        {"time_hour": 1.0, "tide_level": 2.5},
+        {"time_hour": 2.0, "tide_level": 3.0},
+        {"time_hour": 10.0, "tide_level": 2.0},
+        {"time_hour": 11.0, "tide_level": 1.5},
+    ]
+    valid, msg = validate_multi_day_tide_records(discontinuous_records, min_hours=10.0, max_gap_hours=6.0)
+    assert not valid, "时间间隔超过6小时的数据应无效"
+    assert "不连续" in msg, "错误信息应包含'不连续'"
+    print(f"✅ 时间不连续检测通过: {msg}")
+
+    continuous_records = [
+        {"time_hour": 0.0, "tide_level": 2.0},
+        {"time_hour": 2.0, "tide_level": 2.5},
+        {"time_hour": 4.0, "tide_level": 3.0},
+        {"time_hour": 6.0, "tide_level": 2.8},
+        {"time_hour": 8.0, "tide_level": 2.0},
+    ]
+    valid, msg = validate_multi_day_tide_records(continuous_records, min_hours=8.0, max_gap_hours=3.0)
+    assert valid, "间隔2小时的数据应有效"
+    print(f"✅ 连续数据验证通过: {msg}")
+
+    fractional_days_records = generate_multi_day_tide_records(num_days=3)
+    fractional_days_records = [r for r in fractional_days_records if r["time_hour"] <= 60.0]
+    valid, msg = validate_multi_day_tide_records(fractional_days_records, min_hours=48.0)
+    assert valid, "非整天数据也应有效"
+    total_h = get_total_hours(fractional_days_records)
+    assert 60.0 - total_h < 0.1, f"总时长应约为60小时: {total_h}"
+    print(f"✅ 非整天数据验证通过: {msg}")
+
 
 def test_multi_day_simulation():
     print("\n=== 测试多日模拟 ===")

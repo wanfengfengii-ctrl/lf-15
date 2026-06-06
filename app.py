@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 from datetime import datetime
+import math
 
 from database import (
     init_db,
@@ -1091,27 +1092,49 @@ with tab5:
         st.session_state["optimization_results"] = None
     if "compare_results" not in st.session_state:
         st.session_state["compare_results"] = None
+    if "is_sample_data" not in st.session_state:
+        st.session_state["is_sample_data"] = True
 
     st.subheader("📊 多日潮位数据")
 
     col1, col2 = st.columns([2, 1])
     with col1:
+        is_sample = st.session_state.get("is_sample_data", True)
+        slider_label = "预测天数" if is_sample else "数据天数（由上传数据决定）"
         num_days_input = st.slider(
-            "预测天数",
+            slider_label,
             min_value=1,
             max_value=30,
             value=st.session_state["optimization_days"],
             step=1,
+            disabled=not is_sample,
             key="opt_days_slider",
+            help="示例数据模式下可调整天数，上传数据模式下由数据实际覆盖天数" if not is_sample else "调整后自动重新生成对应天数的示例数据",
         )
     with col2:
         st.write("")
         st.write("")
-        if st.button("🔄 生成示例数据", use_container_width=True, key="gen_multi_day"):
-            st.session_state["multi_day_tide_records"] = generate_multi_day_tide_records(num_days=num_days_input)
-            st.session_state["optimization_days"] = num_days_input
-            st.success(f"已生成 {num_days_input} 天示例潮位数据")
-            st.rerun()
+        sample_label = "📊 示例数据" if is_sample else "📁 已上传数据"
+        st.caption(f"数据来源：{sample_label}")
+        if not is_sample:
+            actual_days_display = get_total_hours(st.session_state["multi_day_tide_records"]) / 24
+            st.caption(f"实际覆盖：{actual_days_display:.2f} 天")
+
+    if is_sample and num_days_input != st.session_state["optimization_days"]:
+        st.session_state["optimization_days"] = num_days_input
+        st.session_state["multi_day_tide_records"] = generate_multi_day_tide_records(num_days=num_days_input)
+        st.session_state["optimization_results"] = None
+        st.session_state["compare_results"] = None
+        st.rerun()
+
+    if st.button("🔄 重新生成示例数据", use_container_width=True, key="gen_multi_day"):
+        st.session_state["multi_day_tide_records"] = generate_multi_day_tide_records(num_days=num_days_input)
+        st.session_state["optimization_days"] = num_days_input
+        st.session_state["is_sample_data"] = True
+        st.session_state["optimization_results"] = None
+        st.session_state["compare_results"] = None
+        st.success(f"已重新生成 {num_days_input} 天示例潮位数据")
+        st.rerun()
 
     uploaded_multi_file = st.file_uploader(
         "📁 上传多日潮位 CSV 文件",
@@ -1131,8 +1154,12 @@ with tab5:
                     if st.button("📥 导入此数据", use_container_width=True, key="import_multi_day"):
                         st.session_state["multi_day_tide_records"] = records
                         total_hours = get_total_hours(records)
-                        st.session_state["optimization_days"] = max(1, int(total_hours / 24))
-                        st.success("多日潮位数据已导入")
+                        actual_days = total_hours / 24
+                        st.session_state["optimization_days"] = round(actual_days)
+                        st.session_state["is_sample_data"] = False
+                        st.session_state["optimization_results"] = None
+                        st.session_state["compare_results"] = None
+                        st.success(f"多日潮位数据已导入，覆盖 {actual_days:.2f} 天")
                         st.rerun()
                 else:
                     st.error(f"❌ 数据验证失败: {valid_msg}")
@@ -1150,7 +1177,12 @@ with tab5:
     total_hours = get_total_hours(st.session_state["multi_day_tide_records"])
     actual_days = total_hours / 24
 
-    st.info(f"📊 当前数据覆盖 {total_hours:.1f} 小时 ({actual_days:.1f} 天)，共 {len(tide_multi_df)} 条记录")
+    if st.session_state.get("is_sample_data", True):
+        st.info(f"📊 当前为示例数据，覆盖 {total_hours:.1f} 小时 ({actual_days:.1f} 天)，共 {len(tide_multi_df)} 条记录")
+    else:
+        days_int = int(actual_days)
+        hours_remain = round((actual_days - days_int) * 24, 1)
+        st.info(f"📊 当前为上传数据，覆盖 {total_hours:.1f} 小时 ({days_int}天{hours_remain}小时)，共 {len(tide_multi_df)} 条记录")
 
     preview_fig = go.Figure()
     preview_fig.add_trace(
@@ -1223,11 +1255,15 @@ with tab5:
                     initial_water_level=st.session_state["initial_water_level"],
                 )
 
+                tide_data = st.session_state["multi_day_tide_records"]
+                actual_total_hours = get_total_hours(tide_data)
+                effective_days = max(1, int(math.ceil(actual_total_hours / 24)))
+
                 result = run_full_optimization(
                     params,
-                    st.session_state["multi_day_tide_records"],
+                    tide_data,
                     target=selected_target,
-                    num_days=st.session_state["optimization_days"],
+                    num_days=effective_days,
                     daily_mill_hours=daily_hours,
                 )
 
@@ -1462,10 +1498,14 @@ with tab5:
                             initial_water_level=st.session_state["initial_water_level"],
                         )
 
+                        tide_data = st.session_state["multi_day_tide_records"]
+                        actual_total_hours = get_total_hours(tide_data)
+                        effective_days = max(1, int(math.ceil(actual_total_hours / 24)))
+
                         compare_results = compare_optimization_targets(
                             params,
-                            st.session_state["multi_day_tide_records"],
-                            num_days=st.session_state["optimization_days"],
+                            tide_data,
+                            num_days=effective_days,
                             daily_mill_hours=daily_hours,
                         )
                         st.session_state["compare_results"] = compare_results
