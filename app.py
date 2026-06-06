@@ -50,11 +50,13 @@ from risk_assessment import (
     DisturbanceScenario,
     RiskAssessmentResult,
     EmergencyRecommendation,
+    MonteCarloResult,
     run_disturbed_simulation,
     assess_risks,
     generate_disturbance_scenarios,
     generate_emergency_recommendations,
     compare_risk_scenarios,
+    run_monte_carlo_risk_assessment,
     get_risk_level_color,
     get_risk_level_label,
 )
@@ -1724,21 +1726,62 @@ with tab6:
         st.session_state["custom_rainfall"] = RainfallConfig()
     if "custom_equipment" not in st.session_state:
         st.session_state["custom_equipment"] = EquipmentFailureConfig()
+    if "monte_carlo_result" not in st.session_state:
+        st.session_state["monte_carlo_result"] = None
+    if "use_monte_carlo" not in st.session_state:
+        st.session_state["use_monte_carlo"] = False
+    if "monte_carlo_num" not in st.session_state:
+        st.session_state["monte_carlo_num"] = 100
 
     preset_scenarios = generate_disturbance_scenarios()
     scenario_dict = {s.name: s for s in preset_scenarios}
+
+    slider_keys = [
+        "custom_surge_height", "custom_surge_start", "custom_surge_duration", "custom_surge_shape",
+        "custom_rainfall_rate", "custom_rainfall_start", "custom_rainfall_duration",
+        "custom_runoff_coeff", "custom_catchment_area",
+        "custom_gate_fail", "custom_mill_fail", "custom_gate_flow_red",
+        "custom_failure_start", "custom_failure_duration",
+    ]
+
+    def _init_sliders_from_scenario(scenario_name):
+        sc = scenario_dict[scenario_name]
+        st.session_state["custom_surge_height"] = sc.storm_surge.surge_height
+        st.session_state["custom_surge_start"] = sc.storm_surge.surge_start_hour
+        st.session_state["custom_surge_duration"] = sc.storm_surge.surge_duration_hours
+        st.session_state["custom_surge_shape"] = sc.storm_surge.surge_shape
+        st.session_state["custom_rainfall_rate"] = sc.rainfall.rainfall_rate
+        st.session_state["custom_rainfall_start"] = sc.rainfall.rainfall_start_hour
+        st.session_state["custom_rainfall_duration"] = sc.rainfall.rainfall_duration_hours
+        st.session_state["custom_runoff_coeff"] = sc.rainfall.runoff_coefficient
+        st.session_state["custom_catchment_area"] = sc.rainfall.catchment_area
+        st.session_state["custom_gate_fail"] = sc.equipment.gate_failure_probability
+        st.session_state["custom_mill_fail"] = sc.equipment.mill_failure_probability
+        st.session_state["custom_gate_flow_red"] = int(sc.equipment.gate_flow_reduction_pct)
+        st.session_state["custom_failure_start"] = sc.equipment.failure_start_hour
+        st.session_state["custom_failure_duration"] = sc.equipment.failure_duration_hours
+
+    def _on_scenario_change():
+        new_scenario = st.session_state["risk_scenario_select"]
+        st.session_state["risk_disturbance_scenario"] = new_scenario
+        _init_sliders_from_scenario(new_scenario)
+
+    sliders_initialized = any(k in st.session_state for k in slider_keys)
+    if not sliders_initialized:
+        _init_sliders_from_scenario(st.session_state["risk_disturbance_scenario"])
 
     st.subheader("🎯 扰动场景选择")
 
     col_s1, col_s2 = st.columns([2, 1])
     with col_s1:
         selected_scenario_name = st.selectbox(
-            "选择预设扰动场景",
+            "选择预设扰动场景（选择后参数自动同步到下方滑块",
             options=[s.name for s in preset_scenarios],
             format_func=lambda x: f"{scenario_dict[x].description} ({get_risk_level_label(scenario_dict[x].risk_level)})",
             index=[s.name for s in preset_scenarios].index(st.session_state["risk_disturbance_scenario"])
             if st.session_state["risk_disturbance_scenario"] in scenario_dict else 2,
             key="risk_scenario_select",
+            on_change=_on_scenario_change,
         )
     with col_s2:
         st.write("")
@@ -1748,7 +1791,7 @@ with tab6:
         st.markdown(f"<span style='color:{risk_color};font-weight:bold;'>场景风险等级：{risk_label}</span>", unsafe_allow_html=True)
 
     with st.expander("⚙️ 自定义扰动参数", expanded=False):
-        st.caption("调整以下参数可创建自定义扰动场景，将覆盖预设场景的设置")
+        st.caption("选择预设场景后参数会自动同步到此处，也可手动调整创建自定义场景")
 
         col_c1, col_c2, col_c3 = st.columns(3)
 
@@ -1758,7 +1801,6 @@ with tab6:
                 "潮位抬升高度 (m)",
                 min_value=0.0,
                 max_value=3.0,
-                value=scenario_dict[selected_scenario_name].storm_surge.surge_height,
                 step=0.1,
                 key="custom_surge_height",
             )
@@ -1766,7 +1808,6 @@ with tab6:
                 "开始时间 (小时)",
                 min_value=0.0,
                 max_value=168.0,
-                value=scenario_dict[selected_scenario_name].storm_surge.surge_start_hour,
                 step=1.0,
                 key="custom_surge_start",
             )
@@ -1774,7 +1815,6 @@ with tab6:
                 "持续时间 (小时)",
                 min_value=1.0,
                 max_value=72.0,
-                value=scenario_dict[selected_scenario_name].storm_surge.surge_duration_hours,
                 step=1.0,
                 key="custom_surge_duration",
             )
@@ -1782,9 +1822,6 @@ with tab6:
                 "潮位变化形态",
                 options=["sinusoidal", "triangular", "rectangular"],
                 format_func=lambda x: "正弦曲线" if x == "sinusoidal" else ("三角波" if x == "triangular" else "矩形波"),
-                index=["sinusoidal", "triangular", "rectangular"].index(
-                    scenario_dict[selected_scenario_name].storm_surge.surge_shape
-                ),
                 key="custom_surge_shape",
             )
 
@@ -1794,7 +1831,6 @@ with tab6:
                 "降雨强度 (mm/h)",
                 min_value=0.0,
                 max_value=200.0,
-                value=scenario_dict[selected_scenario_name].rainfall.rainfall_rate,
                 step=5.0,
                 key="custom_rainfall_rate",
             )
@@ -1802,7 +1838,6 @@ with tab6:
                 "开始时间 (小时)",
                 min_value=0.0,
                 max_value=168.0,
-                value=scenario_dict[selected_scenario_name].rainfall.rainfall_start_hour,
                 step=1.0,
                 key="custom_rainfall_start",
             )
@@ -1810,7 +1845,6 @@ with tab6:
                 "持续时间 (小时)",
                 min_value=1.0,
                 max_value=72.0,
-                value=scenario_dict[selected_scenario_name].rainfall.rainfall_duration_hours,
                 step=1.0,
                 key="custom_rainfall_duration",
             )
@@ -1818,7 +1852,6 @@ with tab6:
                 "径流系数",
                 min_value=0.1,
                 max_value=1.0,
-                value=scenario_dict[selected_scenario_name].rainfall.runoff_coefficient,
                 step=0.05,
                 key="custom_runoff_coeff",
             )
@@ -1826,18 +1859,17 @@ with tab6:
                 "集水面积 (m²)",
                 min_value=10.0,
                 max_value=500.0,
-                value=scenario_dict[selected_scenario_name].rainfall.catchment_area,
                 step=10.0,
                 key="custom_catchment_area",
             )
 
         with col_c3:
             st.markdown("**🔧 设备故障参数**")
+            st.caption("💡 启用概率模拟后会基于蒙特卡洛方法评估真实故障概率分布")
             gate_fail_prob = st.slider(
                 "闸门故障概率",
                 min_value=0.0,
                 max_value=1.0,
-                value=scenario_dict[selected_scenario_name].equipment.gate_failure_probability,
                 step=0.05,
                 key="custom_gate_fail",
             )
@@ -1845,7 +1877,6 @@ with tab6:
                 "磨坊故障概率",
                 min_value=0.0,
                 max_value=1.0,
-                value=scenario_dict[selected_scenario_name].equipment.mill_failure_probability,
                 step=0.05,
                 key="custom_mill_fail",
             )
@@ -1853,7 +1884,6 @@ with tab6:
                 "闸门流量降低 (%)",
                 min_value=0,
                 max_value=100,
-                value=int(scenario_dict[selected_scenario_name].equipment.gate_flow_reduction_pct),
                 step=5,
                 key="custom_gate_flow_red",
             )
@@ -1861,7 +1891,6 @@ with tab6:
                 "故障开始时间 (小时)",
                 min_value=0.0,
                 max_value=168.0,
-                value=scenario_dict[selected_scenario_name].equipment.failure_start_hour,
                 step=1.0,
                 key="custom_failure_start",
             )
@@ -1869,7 +1898,6 @@ with tab6:
                 "故障持续时间 (小时)",
                 min_value=1.0,
                 max_value=72.0,
-                value=scenario_dict[selected_scenario_name].equipment.failure_duration_hours,
                 step=1.0,
                 key="custom_failure_duration",
             )
@@ -1878,9 +1906,34 @@ with tab6:
 
     st.subheader("📊 风险评估计算")
 
+    col_mode1, col_mode2, col_mode3 = st.columns(3)
+    with col_mode1:
+        use_mc = st.toggle(
+            "启用概率模拟（蒙特卡洛）",
+            value=st.session_state["use_monte_carlo"],
+            key="use_mc_toggle",
+            help="启用后会运行多次随机模拟，基于真实概率分布评估风险",
+        )
+        st.session_state["use_monte_carlo"] = use_mc
+    with col_mode2:
+        if use_mc:
+            mc_num = st.select_slider(
+                "模拟次数",
+                options=[20, 50, 100, 200, 500],
+                value=st.session_state["monte_carlo_num"],
+                key="mc_num_slider",
+            )
+            st.session_state["monte_carlo_num"] = mc_num
+    with col_mode3:
+        if use_mc:
+            st.info(f"🎲 将运行 {mc_num} 次蒙特卡洛模拟")
+
+    st.markdown("")
+
     col_r1, col_r2, col_r3 = st.columns(3)
     with col_r1:
-        if st.button("🔍 单场景风险评估", use_container_width=True, type="primary", key="run_single_risk"):
+        button_label = "🎲 概率风险评估（蒙特卡洛）" if use_mc else "🔍 单场景风险评估"
+        if st.button(button_label, use_container_width=True, type="primary", key="run_single_risk"):
             with st.spinner("正在进行风险评估计算..."):
                 try:
                     params = SimulationParams(
@@ -1899,24 +1952,24 @@ with tab6:
                         name="custom_scenario",
                         description="用户自定义扰动场景",
                         storm_surge=StormSurgeConfig(
-                            surge_height=surge_height,
-                            surge_start_hour=surge_start,
-                            surge_duration_hours=surge_duration,
-                            surge_shape=surge_shape,
+                            surge_height=st.session_state["custom_surge_height"],
+                            surge_start_hour=st.session_state["custom_surge_start"],
+                            surge_duration_hours=st.session_state["custom_surge_duration"],
+                            surge_shape=st.session_state["custom_surge_shape"],
                         ),
                         rainfall=RainfallConfig(
-                            rainfall_rate=rainfall_rate,
-                            rainfall_start_hour=rainfall_start,
-                            rainfall_duration_hours=rainfall_duration,
-                            runoff_coefficient=runoff_coeff,
-                            catchment_area=catchment_area,
+                            rainfall_rate=st.session_state["custom_rainfall_rate"],
+                            rainfall_start_hour=st.session_state["custom_rainfall_start"],
+                            rainfall_duration_hours=st.session_state["custom_rainfall_duration"],
+                            runoff_coefficient=st.session_state["custom_runoff_coeff"],
+                            catchment_area=st.session_state["custom_catchment_area"],
                         ),
                         equipment=EquipmentFailureConfig(
-                            gate_failure_probability=gate_fail_prob,
-                            mill_failure_probability=mill_fail_prob,
-                            gate_flow_reduction_pct=float(gate_flow_reduction),
-                            failure_start_hour=failure_start,
-                            failure_duration_hours=failure_duration,
+                            gate_failure_probability=st.session_state["custom_gate_fail"],
+                            mill_failure_probability=st.session_state["custom_mill_fail"],
+                            gate_flow_reduction_pct=float(st.session_state["custom_gate_flow_red"]),
+                            failure_start_hour=st.session_state["custom_failure_start"],
+                            failure_duration_hours=st.session_state["custom_failure_duration"],
                         ),
                         risk_level="medium",
                     )
@@ -1926,34 +1979,91 @@ with tab6:
                         description="无扰动基线场景",
                     )
 
-                    baseline_sim, _, _ = run_disturbed_simulation(
-                        params, tide_data,
-                        generate_daily_mill_schedule_for_multi_day(effective_days),
-                        baseline_scenario,
-                        total_hours=total_hours,
-                    )
-                    baseline_risk = assess_risks(params, baseline_sim, baseline_scenario)
+                    if use_mc:
+                        mc_result = run_monte_carlo_risk_assessment(
+                            params, tide_data,
+                            generate_daily_mill_schedule_for_multi_day(effective_days),
+                            custom_scenario,
+                            num_simulations=st.session_state["monte_carlo_num"],
+                        )
 
-                    disturbed_sim, _, _ = run_disturbed_simulation(
-                        params, tide_data,
-                        generate_daily_mill_schedule_for_multi_day(effective_days),
-                        custom_scenario,
-                        total_hours=total_hours,
-                    )
-                    disturbed_risk = assess_risks(params, disturbed_sim, custom_scenario)
+                        baseline_sim, _, _ = run_disturbed_simulation(
+                            params, tide_data,
+                            generate_daily_mill_schedule_for_multi_day(effective_days),
+                            baseline_scenario,
+                            total_hours=total_hours,
+                        )
+                        baseline_risk = assess_risks(params, baseline_sim, baseline_scenario)
 
-                    recommendations = generate_emergency_recommendations(
-                        params, baseline_risk, disturbed_risk, custom_scenario
-                    )
+                        median_disturbed = RiskAssessmentResult(
+                            scenario_name="custom_scenario",
+                            water_shortage_risk=mc_result.median_risks["water_shortage"],
+                            overflow_risk=mc_result.median_risks["overflow"],
+                            shutdown_risk=mc_result.median_risks["shutdown"],
+                            overall_risk_level=mc_result.overall_risk_level,
+                            risk_details={
+                                "low_water_duration_pct": 0,
+                                "overflow_duration_pct": 0,
+                                "mill_availability_pct": 0,
+                            },
+                            simulation_results=mc_result.all_results[0].simulation_results,
+                            metrics={},
+                            warnings=mc_result.warnings,
+                            is_probabilistic=True,
+                            num_simulations=mc_result.num_simulations,
+                            risk_confidence_interval={
+                                "shortage_low": mc_result.percentile_5_risks["water_shortage"],
+                                "shortage_high": mc_result.percentile_95_risks["water_shortage"],
+                                "overflow_low": mc_result.percentile_5_risks["overflow"],
+                                "overflow_high": mc_result.percentile_95_risks["overflow"],
+                                "shutdown_low": mc_result.percentile_5_risks["shutdown"],
+                                "shutdown_high": mc_result.percentile_95_risks["shutdown"],
+                            },
+                        )
 
-                    st.session_state["risk_assessment_results"] = {
-                        "baseline": baseline_risk,
-                        "disturbed": disturbed_risk,
-                    }
-                    st.session_state["risk_emergency_recommendations"] = recommendations
-                    st.session_state["risk_disturbance_scenario"] = selected_scenario_name
+                        recommendations = generate_emergency_recommendations(
+                            params, baseline_risk, median_disturbed, custom_scenario
+                        )
 
-                    st.success("✅ 风险评估计算完成!")
+                        st.session_state["monte_carlo_result"] = mc_result
+                        st.session_state["risk_assessment_results"] = {
+                            "baseline": baseline_risk,
+                            "disturbed": median_disturbed,
+                        }
+                        st.session_state["risk_emergency_recommendations"] = recommendations
+                        st.session_state["risk_disturbance_scenario"] = selected_scenario_name
+
+                        st.success(f"✅ 蒙特卡洛风险评估完成! 共运行 {mc_result.num_simulations} 次模拟")
+                    else:
+                        baseline_sim, _, _ = run_disturbed_simulation(
+                            params, tide_data,
+                            generate_daily_mill_schedule_for_multi_day(effective_days),
+                            baseline_scenario,
+                            total_hours=total_hours,
+                        )
+                        baseline_risk = assess_risks(params, baseline_sim, baseline_scenario)
+
+                        disturbed_sim, _, _ = run_disturbed_simulation(
+                            params, tide_data,
+                            generate_daily_mill_schedule_for_multi_day(effective_days),
+                            custom_scenario,
+                            total_hours=total_hours,
+                        )
+                        disturbed_risk = assess_risks(params, disturbed_sim, custom_scenario)
+
+                        recommendations = generate_emergency_recommendations(
+                            params, baseline_risk, disturbed_risk, custom_scenario
+                        )
+
+                        st.session_state["risk_assessment_results"] = {
+                            "baseline": baseline_risk,
+                            "disturbed": disturbed_risk,
+                        }
+                        st.session_state["risk_emergency_recommendations"] = recommendations
+                        st.session_state["risk_disturbance_scenario"] = selected_scenario_name
+                        st.session_state["monte_carlo_result"] = None
+
+                        st.success("✅ 风险评估计算完成!")
                 except Exception as e:
                     st.error(f"风险评估失败: {e}")
                     import traceback
@@ -1997,10 +2107,15 @@ with tab6:
     st.divider()
 
     if st.session_state.get("risk_assessment_results") is not None:
-        st.subheader("📈 单场景风险评估结果")
-
         baseline_risk = st.session_state["risk_assessment_results"]["baseline"]
         disturbed_risk = st.session_state["risk_assessment_results"]["disturbed"]
+        is_prob = disturbed_risk.is_probabilistic if hasattr(disturbed_risk, 'is_probabilistic') and disturbed_risk.is_probabilistic
+
+        if is_prob:
+            st.subheader("📈 概率风险评估结果（蒙特卡洛）")
+            st.caption(f"基于 {disturbed_risk.num_simulations} 次随机模拟，展示中位数风险值及 5%-95% 置信区间")
+        else:
+            st.subheader("📈 单场景风险评估结果（确定性）")
 
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
@@ -2042,6 +2157,74 @@ with tab6:
             with st.expander(f"⚠️ 风险警告 ({len(disturbed_risk.warnings)} 条)", expanded=True):
                 for w in disturbed_risk.warnings:
                     st.warning(w)
+
+        if is_prob and hasattr(disturbed_risk, 'risk_confidence_interval') and disturbed_risk.risk_confidence_interval:
+            st.subheader("📊 置信区间（5%-95%）")
+            ci = disturbed_risk.risk_confidence_interval
+            col_ci1, col_ci2, col_ci3 = st.columns(3)
+            with col_ci1:
+                st.metric(
+                    "缺水风险范围",
+                    f"{ci['shortage_low']:.1f}% - {ci['shortage_high']:.1f}%",
+                    delta=f"中位数 {disturbed_risk.water_shortage_risk:.1f}%",
+                )
+            with col_ci2:
+                st.metric(
+                    "溢流风险范围",
+                    f"{ci['overflow_low']:.1f}% - {ci['overflow_high']:.1f}%",
+                    delta=f"中位数 {disturbed_risk.overflow_risk:.1f}%",
+                )
+            with col_ci3:
+                st.metric(
+                    "停机风险范围",
+                    f"{ci['shutdown_low']:.1f}% - {ci['shutdown_high']:.1f}%",
+                    delta=f"中位数 {disturbed_risk.shutdown_risk:.1f}%",
+                )
+
+            mc_result = st.session_state.get("monte_carlo_result")
+            if mc_result:
+                with st.expander("📈 风险分布直方图", expanded=False):
+                    dist = mc_result.risk_distributions
+                    fig_dist = make_subplots(
+                        rows=1, cols=3,
+                        subplot_titles=("缺水风险分布", "溢流风险分布", "停机风险分布"),
+                    )
+                    fig_dist.add_trace(
+                        go.Histogram(x=dist["water_shortage"], nbinsx=20, name="缺水风险", marker_color="#ff7f0e"),
+                        row=1, col=1,
+                    )
+                    fig_dist.add_trace(
+                        go.Histogram(x=dist["overflow"], nbinsx=20, name="溢流风险", marker_color="#d62728"),
+                        row=1, col=2,
+                    )
+                    fig_dist.add_trace(
+                        go.Histogram(x=dist["shutdown"], nbinsx=20, name="停机风险", marker_color="#9467bd"),
+                        row=1, col=3,
+                    )
+                    fig_dist.update_layout(
+                        height=350,
+                        showlegend=False,
+                        title_text=f"风险概率分布 (n={mc_result.num_simulations})",
+                    )
+                    fig_dist.update_xaxes(title_text="风险值 (%)")
+                    fig_dist.update_yaxes(title_text="频次")
+                    st.plotly_chart(fig_dist, use_container_width=True)
+
+                    dist_stats = pd.DataFrame([
+                        {"指标": "均值 (%)", "缺水风险": round(mc_result.mean_risks["water_shortage"], 1),
+                         "溢流风险": round(mc_result.mean_risks["overflow"], 1),
+                         "停机风险": round(mc_result.mean_risks["shutdown"], 1)},
+                        {"指标": "中位数 (%)", "缺水风险": round(mc_result.median_risks["water_shortage"], 1),
+                         "溢流风险": round(mc_result.median_risks["overflow"], 1),
+                         "停机风险": round(mc_result.median_risks["shutdown"], 1)},
+                        {"指标": "5%分位数 (%)", "缺水风险": round(mc_result.percentile_5_risks["water_shortage"], 1),
+                         "溢流风险": round(mc_result.percentile_5_risks["overflow"], 1),
+                         "停机风险": round(mc_result.percentile_5_risks["shutdown"], 1)},
+                        {"指标": "95%分位数 (%)", "缺水风险": round(mc_result.percentile_95_risks["water_shortage"], 1),
+                         "溢流风险": round(mc_result.percentile_95_risks["overflow"], 1),
+                         "停机风险": round(mc_result.percentile_95_risks["shutdown"], 1)},
+                    ])
+                    st.dataframe(dist_stats, use_container_width=True, hide_index=True)
 
         st.subheader("📊 详细风险指标对比")
 

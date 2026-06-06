@@ -23,17 +23,24 @@ from risk_assessment import (
     StormSurgeConfig,
     RainfallConfig,
     EquipmentFailureConfig,
+    EquipmentFailureState,
     DisturbanceScenario,
     RiskAssessmentResult,
     EmergencyRecommendation,
+    MonteCarloResult,
     run_disturbed_simulation,
     assess_risks,
     generate_disturbance_scenarios,
     generate_emergency_recommendations,
     compare_risk_scenarios,
+    run_monte_carlo_risk_assessment,
     get_risk_level_color,
     get_risk_level_label,
     apply_storm_surge_to_tide,
+    has_storm_surge,
+    has_rainfall,
+    has_equipment_failure,
+    get_disturbance_time_window,
 )
 
 
@@ -902,8 +909,283 @@ def test_risk_comparison():
     print("✅ 严重风暴溢流风险高于基线（符合预期）")
 
 
+def test_equipment_failure_state():
+    print("\n=== 测试设备故障状态采样 ===")
+
+    config = EquipmentFailureConfig(
+        gate_failure_probability=0.5,
+        mill_failure_probability=0.5,
+        gate_flow_reduction_pct=50.0,
+        failure_start_hour=24.0,
+        failure_duration_hours=12.0,
+    )
+
+    num_samples = 1000
+    gate_fail_count = 0
+    mill_fail_count = 0
+
+    for i in range(num_samples):
+        state = config.sample(random_seed=i)
+        assert isinstance(state, EquipmentFailureState)
+        if state.gate_failed:
+            gate_fail_count += 1
+        if state.mill_failed:
+            mill_fail_count += 1
+
+    gate_fail_rate = gate_fail_count / num_samples
+    mill_fail_rate = mill_fail_count / num_samples
+
+    assert 0.4 < gate_fail_rate < 0.6, f"闸门故障率应接近0.5，实际: {gate_fail_rate}"
+    assert 0.4 < mill_fail_rate < 0.6, f"磨坊故障率应接近0.5，实际: {mill_fail_rate}"
+    print(f"✅ 闸门故障率符合预期: {gate_fail_rate:.3f} (预期 ~0.5)")
+    print(f"✅ 磨坊故障率符合预期: {mill_fail_rate:.3f} (预期 ~0.5)")
+
+    state_normal = EquipmentFailureState()
+    assert not state_normal.gate_failed
+    assert not state_normal.mill_failed
+    assert state_normal.effective_gate_flow(100.0, 10.0) == 100.0
+    assert state_normal.mill_available(10.0)
+    print("✅ 正常状态下设备全部可用")
+
+    state_failed = EquipmentFailureState(
+        gate_failed=True,
+        mill_failed=True,
+        gate_flow_reduction_pct=50.0,
+        failure_start_hour=0.0,
+        failure_duration_hours=24.0,
+    )
+    assert state_failed.effective_gate_flow(100.0, 10.0) == 50.0
+    assert not state_failed.mill_available(10.0)
+    print("✅ 故障状态下设备功能受限正确")
+
+
+def test_disturbance_detection():
+    print("\n=== 测试扰动因素检测 ===")
+
+    baseline = DisturbanceScenario(name="baseline")
+    assert not has_storm_surge(baseline)
+    assert not has_rainfall(baseline)
+    assert not has_equipment_failure(baseline)
+    print("✅ 基线场景无任何扰动")
+
+    storm_only = DisturbanceScenario(
+        name="storm",
+        storm_surge=StormSurgeConfig(surge_height=1.0),
+    )
+    assert has_storm_surge(storm_only)
+    assert not has_rainfall(storm_only)
+    assert not has_equipment_failure(storm_only)
+    print("✅ 仅风暴潮场景检测正确")
+
+    equip_only = DisturbanceScenario(
+        name="equip",
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.3,
+            mill_failure_probability=0.0,
+        ),
+    )
+    assert not has_storm_surge(equip_only)
+    assert not has_rainfall(equip_only)
+    assert has_equipment_failure(equip_only)
+    print("✅ 仅设备故障场景检测正确")
+
+    all_disturb = DisturbanceScenario(
+        name="all",
+        storm_surge=StormSurgeConfig(surge_height=1.5),
+        rainfall=RainfallConfig(rainfall_rate=50.0),
+        equipment=EquipmentFailureConfig(gate_failure_probability=0.5),
+    )
+    assert has_storm_surge(all_disturb)
+    assert has_rainfall(all_disturb)
+    assert has_equipment_failure(all_disturb)
+    print("✅ 全扰动场景检测正确")
+
+
+def test_disturbance_time_window():
+    print("\n=== 测试扰动时间窗口 ===")
+
+    baseline = DisturbanceScenario(name="baseline")
+    start, end = get_disturbance_time_window(baseline)
+    assert start == 0.0 and end == 24.0
+    print(f"✅ 基线场景默认窗口: {start}-{end}h")
+
+    storm_only = DisturbanceScenario(
+        name="storm",
+        storm_surge=StormSurgeConfig(
+            surge_height=1.0,
+            surge_start_hour=24.0,
+            surge_duration_hours=12.0,
+        ),
+    )
+    start, end = get_disturbance_time_window(storm_only)
+    assert start == 24.0 and end == 36.0
+    print(f"✅ 仅风暴潮窗口正确: {start}-{end}h")
+
+    equip_only = DisturbanceScenario(
+        name="equip",
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.5,
+            failure_start_hour=36.0,
+            failure_duration_hours=24.0,
+        ),
+    )
+    start, end = get_disturbance_time_window(equip_only)
+    assert start == 36.0 and end == 60.0
+    print(f"✅ 仅设备故障窗口正确: {start}-{end}h")
+
+    mixed = DisturbanceScenario(
+        name="mixed",
+        storm_surge=StormSurgeConfig(
+            surge_height=1.0,
+            surge_start_hour=12.0,
+            surge_duration_hours=24.0,
+        ),
+        rainfall=RainfallConfig(
+            rainfall_rate=30.0,
+            rainfall_start_hour=24.0,
+            rainfall_duration_hours=12.0,
+        ),
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.3,
+            failure_start_hour=20.0,
+            failure_duration_hours=8.0,
+        ),
+    )
+    start, end = get_disturbance_time_window(mixed)
+    assert start == 12.0 and end == 36.0
+    print(f"✅ 多扰动合并窗口正确: {start}-{end}h")
+
+
+def test_monte_carlo_simulation():
+    print("\n=== 测试蒙特卡洛模拟 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    scenario = DisturbanceScenario(
+        name="test_mc",
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.5,
+            mill_failure_probability=0.5,
+            gate_flow_reduction_pct=50.0,
+            failure_start_hour=24.0,
+            failure_duration_hours=24.0,
+        ),
+    )
+
+    mc_result = run_monte_carlo_risk_assessment(
+        params, tide_records, mill_schedule, scenario,
+        num_simulations=50, base_seed=42,
+    )
+
+    assert isinstance(mc_result, MonteCarloResult)
+    assert mc_result.num_simulations == 50
+    assert len(mc_result.all_results) == 50
+    print(f"✅ 蒙特卡洛模拟运行次数正确: {mc_result.num_simulations} 次")
+
+    assert "water_shortage" in mc_result.mean_risks
+    assert "overflow" in mc_result.mean_risks
+    assert "shutdown" in mc_result.mean_risks
+    print("✅ 风险均值计算包含三项指标")
+
+    assert mc_result.percentile_5_risks["water_shortage"] <= mc_result.median_risks["water_shortage"]
+    assert mc_result.median_risks["water_shortage"] <= mc_result.percentile_95_risks["water_shortage"]
+    print("✅ 分位数排序正确（5% ≤ 中位数 ≤ 95%）")
+
+    assert mc_result.overall_risk_level in ["low", "medium", "high", "critical"]
+    print(f"✅ 综合风险等级: {get_risk_level_label(mc_result.overall_risk_level)}")
+
+    assert isinstance(mc_result.warnings, list)
+    print(f"✅ 风险警告数量: {len(mc_result.warnings)} 条")
+
+    assert len(mc_result.risk_distributions["water_shortage"]) == 50
+    assert len(mc_result.risk_distributions["overflow"]) == 50
+    assert len(mc_result.risk_distributions["shutdown"]) == 50
+    print("✅ 风险分布数据完整")
+
+
+def test_emergency_recommendations_time_window():
+    print("\n=== 测试应急建议时间窗口合理性 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    baseline = DisturbanceScenario(name="baseline")
+    baseline_sim, _, _ = run_disturbed_simulation(params, tide_records, mill_schedule, baseline)
+    baseline_risk = assess_risks(params, baseline_sim, baseline)
+
+    print("  测试1: 仅设备故障场景")
+    equip_only = DisturbanceScenario(
+        name="equip_only",
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.7,
+            mill_failure_probability=0.6,
+            gate_flow_reduction_pct=60.0,
+            failure_start_hour=36.0,
+            failure_duration_hours=24.0,
+        ),
+    )
+    equip_sim, _, _ = run_disturbed_simulation(params, tide_records, mill_schedule, equip_only)
+    equip_risk = assess_risks(params, equip_sim, equip_only)
+
+    recs = generate_emergency_recommendations(params, baseline_risk, equip_risk, equip_only)
+    print(f"  生成建议数量: {len(recs)}")
+
+    for rec in recs:
+        start, end = rec.time_window
+        assert start < end, f"建议'{rec.action}'时间窗口无效: {start}-{end}"
+        assert start >= 0, f"建议'{rec.action}'开始时间不能为负: {start}"
+        print(f"    ✅ {rec.action}: 第{start:.1f}h - 第{end:.1f}h ({rec.priority})")
+
+    mill_recs = [r for r in recs if "磨坊" in r.action or "设备" in r.action]
+    if mill_recs:
+        for rec in mill_recs:
+            start, end = rec.time_window
+            assert abs(start - 36.0) < 12.0 or "检修" in rec.action, f"设备相关建议应在故障时间附近"
+        print("  ✅ 设备相关建议时间窗口合理")
+
+    print("  测试2: 仅风暴潮场景")
+    storm_only = DisturbanceScenario(
+        name="storm_only",
+        storm_surge=StormSurgeConfig(
+            surge_height=2.0,
+            surge_start_hour=24.0,
+            surge_duration_hours=12.0,
+        ),
+    )
+    storm_sim, _, _ = run_disturbed_simulation(params, tide_records, mill_schedule, storm_only)
+    storm_risk = assess_risks(params, storm_sim, storm_only)
+
+    recs_storm = generate_emergency_recommendations(params, baseline_risk, storm_risk, storm_only)
+    print(f"  生成建议数量: {len(recs_storm)}")
+
+    for rec in recs_storm:
+        start, end = rec.time_window
+        assert start < end, f"建议'{rec.action}'时间窗口无效"
+        assert start >= 0, f"建议'{rec.action}'开始时间不能为负"
+        print(f"    ✅ {rec.action}: 第{start:.1f}h - 第{end:.1f}h ({rec.priority})")
+
+    print("  ✅ 所有应急建议时间窗口均合理")
+
+
 def main():
-    print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v3")
+    print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v4")
     print("=" * 60)
 
     try:
@@ -929,6 +1211,11 @@ def main():
         test_emergency_recommendations()
         test_disturbance_scenarios()
         test_risk_comparison()
+        test_equipment_failure_state()
+        test_disturbance_detection()
+        test_disturbance_time_window()
+        test_monte_carlo_simulation()
+        test_emergency_recommendations_time_window()
 
         print("\n" + "=" * 60)
         print("🎉 所有测试通过! 系统运行正常。")

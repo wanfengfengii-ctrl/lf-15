@@ -1,4 +1,6 @@
 import math
+import random
+import statistics
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from simulation import (
@@ -83,6 +85,42 @@ class EquipmentFailureConfig:
             return True
         return self.mill_failure_probability < 0.5
 
+    def sample(self, random_seed: int = None) -> "EquipmentFailureState":
+        rng = random.Random(random_seed)
+        gate_failed = rng.random() < self.gate_failure_probability
+        mill_failed = rng.random() < self.mill_failure_probability
+        return EquipmentFailureState(
+            gate_failed=gate_failed,
+            mill_failed=mill_failed,
+            gate_flow_reduction_pct=self.gate_flow_reduction_pct if gate_failed else 0.0,
+            failure_start_hour=self.failure_start_hour,
+            failure_duration_hours=self.failure_duration_hours,
+        )
+
+
+@dataclass
+class EquipmentFailureState:
+    gate_failed: bool = False
+    mill_failed: bool = False
+    gate_flow_reduction_pct: float = 0.0
+    failure_start_hour: float = 0.0
+    failure_duration_hours: float = 6.0
+
+    def is_failure_period(self, time_hour: float) -> bool:
+        return (self.failure_start_hour <= time_hour <=
+                self.failure_start_hour + self.failure_duration_hours)
+
+    def effective_gate_flow(self, base_flow: float, time_hour: float) -> float:
+        if not self.gate_failed or not self.is_failure_period(time_hour):
+            return base_flow
+        reduction = self.gate_flow_reduction_pct / 100.0
+        return base_flow * (1 - reduction)
+
+    def mill_available(self, time_hour: float) -> bool:
+        if not self.mill_failed or not self.is_failure_period(time_hour):
+            return True
+        return False
+
 
 @dataclass
 class DisturbanceScenario:
@@ -105,6 +143,58 @@ class RiskAssessmentResult:
     simulation_results: List[Dict]
     metrics: Dict
     warnings: List[str]
+    is_probabilistic: bool = False
+    num_simulations: int = 1
+    risk_confidence_interval: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class MonteCarloResult:
+    scenario_name: str
+    num_simulations: int
+    mean_risks: Dict[str, float]
+    median_risks: Dict[str, float]
+    percentile_95_risks: Dict[str, float]
+    percentile_5_risks: Dict[str, float]
+    risk_distributions: Dict[str, List[float]]
+    all_results: List[RiskAssessmentResult]
+    overall_risk_level: str
+    warnings: List[str]
+
+
+def has_storm_surge(scenario: DisturbanceScenario) -> bool:
+    return scenario.storm_surge.surge_height > 0.01
+
+
+def has_rainfall(scenario: DisturbanceScenario) -> bool:
+    return scenario.rainfall.rainfall_rate > 0.1
+
+
+def has_equipment_failure(scenario: DisturbanceScenario) -> bool:
+    return (scenario.equipment.gate_failure_probability > 0.01 or
+            scenario.equipment.mill_failure_probability > 0.01)
+
+
+def get_disturbance_time_window(scenario: DisturbanceScenario) -> Tuple[float, float]:
+    start_times = []
+    end_times = []
+
+    if has_storm_surge(scenario):
+        start_times.append(scenario.storm_surge.surge_start_hour)
+        end_times.append(scenario.storm_surge.surge_start_hour + scenario.storm_surge.surge_duration_hours)
+
+    if has_rainfall(scenario):
+        start_times.append(scenario.rainfall.rainfall_start_hour)
+        end_times.append(scenario.rainfall.rainfall_start_hour + scenario.rainfall.rainfall_duration_hours)
+
+    if has_equipment_failure(scenario):
+        start_times.append(scenario.equipment.failure_start_hour)
+        end_times.append(scenario.equipment.failure_start_hour + scenario.equipment.failure_duration_hours)
+
+    if not start_times:
+        return (0.0, 24.0)
+
+    return (min(start_times), max(end_times))
 
 
 def apply_storm_surge_to_tide(
@@ -127,11 +217,15 @@ def run_disturbed_simulation(
     mill_schedule: List[Dict],
     disturbance: DisturbanceScenario,
     total_hours: float = None,
+    equipment_state: EquipmentFailureState = None,
 ) -> Tuple[List[Dict], List[Dict], List[str]]:
     if total_hours is None:
         total_hours = get_total_hours(tide_records)
 
     modified_tide = apply_storm_surge_to_tide(tide_records, disturbance.storm_surge)
+
+    if equipment_state is None:
+        equipment_state = EquipmentFailureState()
 
     num_steps = int(total_hours / params.time_step_hours) + 1
     time_hours = [i * params.time_step_hours for i in range(num_steps)]
@@ -154,7 +248,7 @@ def run_disturbed_simulation(
             s["start_hour"] <= t < s["end_hour"] for s in mill_schedule
         )
 
-        if mill_running and not disturbance.equipment.mill_available(t):
+        if mill_running and not equipment_state.mill_available(t):
             mill_running = False
             if not any("磨坊设备故障" in w for w in warnings):
                 warnings.append(f"时间 {t:.1f}h: 磨坊设备故障，无法运行")
@@ -180,7 +274,7 @@ def run_disturbed_simulation(
         flow_rate = calculate_gate_flow(
             tide_level, prev_height, gate_ratio, params.gate_max_flow
         )
-        flow_rate = disturbance.equipment.effective_gate_flow(flow_rate, t)
+        flow_rate = equipment_state.effective_gate_flow(flow_rate, t)
 
         rainfall_inflow = disturbance.rainfall.inflow_at_time(t)
         total_inflow = flow_rate + rainfall_inflow if flow_rate > 0 else flow_rate
@@ -227,6 +321,8 @@ def run_disturbed_simulation(
             "mill_running": mill_running_list[i],
             "storm_surge": disturbance.storm_surge.surge_at_time(time_hours[i]),
             "rainfall_inflow": disturbance.rainfall.inflow_at_time(time_hours[i]),
+            "equipment_gate_failed": equipment_state.gate_failed and equipment_state.is_failure_period(time_hours[i]),
+            "equipment_mill_failed": equipment_state.mill_failed and equipment_state.is_failure_period(time_hours[i]),
         })
 
     from simulation import generate_gate_schedule
@@ -493,15 +589,29 @@ def generate_emergency_recommendations(
     delta_overflow = disturbed_result.overflow_risk - baseline_result.overflow_risk
     delta_shutdown = disturbed_result.shutdown_risk - baseline_result.shutdown_risk
 
+    dist_start, dist_end = get_disturbance_time_window(disturbance)
+    dist_duration = dist_end - dist_start
+
+    has_storm = has_storm_surge(disturbance)
+    has_rain = has_rainfall(disturbance)
+    has_equip = has_equipment_failure(disturbance)
+
     if delta_overflow > 10 or disturbed_result.overflow_risk > 30:
+        overflow_causes = []
+        if has_storm:
+            overflow_causes.append("风暴潮")
+        if has_rain:
+            overflow_causes.append("降雨入流")
+        cause_desc = "、".join(overflow_causes) if overflow_causes else "扰动"
+
         recommendations.append(EmergencyRecommendation(
             action="提前泄洪",
-            description="风暴潮/降雨来临前，提前降低蓄水池水位，预留防洪库容",
+            description=f"{cause_desc}来临前，提前降低蓄水池水位，预留防洪库容",
             priority="high" if delta_overflow > 30 else "medium",
             risk_impact="降低溢流风险",
             time_window=(
-                max(0.0, disturbance.storm_surge.surge_start_hour - 6.0),
-                disturbance.storm_surge.surge_start_hour,
+                max(0.0, dist_start - 6.0),
+                dist_start,
             ),
             details={
                 "目标水位": f"{params.reservoir_capacity * 0.5:.1f} m³",
@@ -514,10 +624,7 @@ def generate_emergency_recommendations(
             description="高潮位时段限制闸门开启，减少进水量，防止溢流",
             priority="high" if disturbed_result.overflow_risk > 50 else "medium",
             risk_impact="降低溢流风险",
-            time_window=(
-                disturbance.storm_surge.surge_start_hour,
-                disturbance.storm_surge.surge_start_hour + disturbance.storm_surge.surge_duration_hours,
-            ),
+            time_window=(dist_start, dist_end),
             details={
                 "闸门最大开启比例": "50%",
                 "触发水位阈值": f"{params.reservoir_capacity * 0.8:.1f} m³",
@@ -525,14 +632,21 @@ def generate_emergency_recommendations(
         ))
 
     if delta_shortage > 10 or disturbed_result.water_shortage_risk > 30:
+        shortage_causes = []
+        if has_equip:
+            shortage_causes.append("设备故障导致进水不足")
+        if has_storm and not has_rain:
+            shortage_causes.append("高潮后低潮期延长")
+        cause_desc = "、".join(shortage_causes) if shortage_causes else "扰动"
+
         recommendations.append(EmergencyRecommendation(
             action="提前蓄水",
-            description="扰动来临前的高潮期加大蓄水，提高水位安全裕度",
+            description=f"{cause_desc}来临前的高潮期加大蓄水，提高水位安全裕度",
             priority="high" if delta_shortage > 30 else "medium",
             risk_impact="降低缺水风险",
             time_window=(
-                0.0,
-                max(0.0, disturbance.storm_surge.surge_start_hour - 6.0),
+                max(0.0, dist_start - 24.0),
+                max(0.0, dist_start - 2.0),
             ),
             details={
                 "目标水位": f"{params.reservoir_capacity * 0.85:.1f} m³",
@@ -541,30 +655,42 @@ def generate_emergency_recommendations(
         ))
 
     if delta_shutdown > 10 or disturbed_result.shutdown_risk > 30:
+        shutdown_causes = []
+        if has_equip:
+            shutdown_causes.append("设备故障")
+        if delta_shortage > 5:
+            shutdown_causes.append("缺水停机")
+        cause_desc = "、".join(shutdown_causes) if shutdown_causes else "扰动"
+
+        if has_equip:
+            equip_start = disturbance.equipment.failure_start_hour
+            equip_end = disturbance.equipment.failure_start_hour + disturbance.equipment.failure_duration_hours
+            mill_window = (equip_start, equip_end)
+        else:
+            mill_window = (dist_start, dist_end)
+
         recommendations.append(EmergencyRecommendation(
             action="调整磨坊计划",
-            description="将磨粉作业提前或延后，避开设备故障和缺水高峰时段",
+            description=f"将磨粉作业提前或延后，避开{cause_desc}高峰时段",
             priority="high" if delta_shutdown > 30 else "medium",
             risk_impact="降低停机风险",
-            time_window=(
-                disturbance.equipment.failure_start_hour,
-                disturbance.equipment.failure_start_hour + disturbance.equipment.failure_duration_hours,
-            ),
+            time_window=mill_window,
             details={
                 "建议转移产量比例": "40%",
                 "目标时段": "故障期前后的高潮位时段",
             }
         ))
 
-        if disturbance.equipment.mill_failure_probability > 0.3:
+        if has_equip and (disturbance.equipment.mill_failure_probability > 0.2 or
+                          disturbance.equipment.gate_failure_probability > 0.2):
             recommendations.append(EmergencyRecommendation(
                 action="设备检修",
-                description="风暴前对磨坊和闸门设备进行检查维护，降低故障概率",
+                description="扰动来临前对磨坊和闸门设备进行检查维护，降低故障概率",
                 priority="medium",
                 risk_impact="降低设备故障风险",
                 time_window=(
-                    max(0.0, disturbance.equipment.failure_start_hour - 12.0),
-                    disturbance.equipment.failure_start_hour,
+                    max(0.0, dist_start - 12.0),
+                    dist_start,
                 ),
                 details={
                     "预计降低故障概率": "约30%",
@@ -578,17 +704,14 @@ def generate_emergency_recommendations(
             description="确保应急供电系统就绪，应对极端情况下的设备运行",
             priority="medium",
             risk_impact="提升系统可靠性",
-            time_window=(
-                disturbance.storm_surge.surge_start_hour,
-                disturbance.storm_surge.surge_start_hour + disturbance.storm_surge.surge_duration_hours,
-            ),
+            time_window=(dist_start, dist_end),
             details={
                 "备用容量": "100%",
                 "启动条件": "主电源故障或水位超过警戒线",
             }
         ))
 
-    if disturbance.rainfall.rainfall_rate > 30:
+    if has_rain and disturbance.rainfall.rainfall_rate > 30:
         recommendations.append(EmergencyRecommendation(
             action="启用备用水源",
             description="降雨量大时可考虑收集雨水作为备用水源",
@@ -601,6 +724,22 @@ def generate_emergency_recommendations(
             details={
                 "预计额外收集水量": f"{disturbance.rainfall.rainfall_rate * disturbance.rainfall.rainfall_duration_hours * 0.1:.1f} m³",
                 "注意事项": "需确保水质符合使用标准",
+            }
+        ))
+
+    if has_storm and disturbance.storm_surge.surge_height > 1.0:
+        recommendations.append(EmergencyRecommendation(
+            action="加固堤防",
+            description="风暴潮潮位较高时，检查并加固围堤，防止海水漫溢",
+            priority="medium",
+            risk_impact="降低溃堤风险",
+            time_window=(
+                max(0.0, disturbance.storm_surge.surge_start_hour - 12.0),
+                disturbance.storm_surge.surge_start_hour + disturbance.storm_surge.surge_duration_hours,
+            ),
+            details={
+                "警戒潮位": f"{disturbance.storm_surge.surge_height + 2.0:.1f} m",
+                "重点检查区域": "堤岸薄弱段、闸门连接处",
             }
         ))
 
@@ -650,3 +789,104 @@ def get_risk_level_label(level: str) -> str:
         "unknown": "未知",
     }
     return labels.get(level, "未知")
+
+
+def run_monte_carlo_risk_assessment(
+    params: SimulationParams,
+    tide_records: List[Dict],
+    mill_schedule: List[Dict],
+    disturbance: DisturbanceScenario,
+    num_simulations: int = 100,
+    base_seed: int = 42,
+) -> MonteCarloResult:
+    all_results = []
+    total_hours = get_total_hours(tide_records)
+
+    for i in range(num_simulations):
+        seed = base_seed + i
+        equipment_state = disturbance.equipment.sample(random_seed=seed)
+
+        sim_results, _, warnings = run_disturbed_simulation(
+            params, tide_records, mill_schedule, disturbance,
+            total_hours=total_hours, equipment_state=equipment_state,
+        )
+        risk_result = assess_risks(params, sim_results, disturbance)
+        risk_result.warnings.extend(warnings)
+        risk_result.is_probabilistic = True
+        all_results.append(risk_result)
+
+    shortage_risks = [r.water_shortage_risk for r in all_results]
+    overflow_risks = [r.overflow_risk for r in all_results]
+    shutdown_risks = [r.shutdown_risk for r in all_results]
+
+    shortage_sorted = sorted(shortage_risks)
+    overflow_sorted = sorted(overflow_risks)
+    shutdown_sorted = sorted(shutdown_risks)
+
+    def percentile(sorted_list, pct):
+        idx = int(len(sorted_list) * pct / 100)
+        idx = max(0, min(len(sorted_list) - 1, idx))
+        return sorted_list[idx]
+
+    mean_risks = {
+        "water_shortage": statistics.mean(shortage_risks),
+        "overflow": statistics.mean(overflow_risks),
+        "shutdown": statistics.mean(shutdown_risks),
+    }
+    median_risks = {
+        "water_shortage": statistics.median(shortage_risks),
+        "overflow": statistics.median(overflow_risks),
+        "shutdown": statistics.median(shutdown_risks),
+    }
+    percentile_95_risks = {
+        "water_shortage": percentile(shortage_sorted, 95),
+        "overflow": percentile(overflow_sorted, 95),
+        "shutdown": percentile(shutdown_sorted, 95),
+    }
+    percentile_5_risks = {
+        "water_shortage": percentile(shortage_sorted, 5),
+        "overflow": percentile(overflow_sorted, 5),
+        "shutdown": percentile(shutdown_sorted, 5),
+    }
+
+    risk_distributions = {
+        "water_shortage": shortage_risks,
+        "overflow": overflow_risks,
+        "shutdown": shutdown_risks,
+    }
+
+    overall_mean = (
+        mean_risks["water_shortage"] * 0.35 +
+        mean_risks["overflow"] * 0.35 +
+        mean_risks["shutdown"] * 0.30
+    )
+
+    if overall_mean >= 70:
+        overall_level = "critical"
+    elif overall_mean >= 40:
+        overall_level = "high"
+    elif overall_mean >= 20:
+        overall_level = "medium"
+    else:
+        overall_level = "low"
+
+    warnings = []
+    if percentile_95_risks["overflow"] >= 50:
+        warnings.append("⚠️ 95%置信度下溢流风险较高，需重点关注")
+    if percentile_95_risks["water_shortage"] >= 50:
+        warnings.append("⚠️ 95%置信度下缺水风险较高，需重点关注")
+    if percentile_95_risks["shutdown"] >= 50:
+        warnings.append("⚠️ 95%置信度下停机风险较高，需重点关注")
+
+    return MonteCarloResult(
+        scenario_name=disturbance.name,
+        num_simulations=num_simulations,
+        mean_risks=mean_risks,
+        median_risks=median_risks,
+        percentile_95_risks=percentile_95_risks,
+        percentile_5_risks=percentile_5_risks,
+        risk_distributions=risk_distributions,
+        all_results=all_results,
+        overall_risk_level=overall_level,
+        warnings=warnings,
+    )
