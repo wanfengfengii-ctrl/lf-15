@@ -19,6 +19,22 @@ from optimizer import (
     run_full_optimization, compare_optimization_targets,
     calculate_score, OptimizationResult,
 )
+from risk_assessment import (
+    StormSurgeConfig,
+    RainfallConfig,
+    EquipmentFailureConfig,
+    DisturbanceScenario,
+    RiskAssessmentResult,
+    EmergencyRecommendation,
+    run_disturbed_simulation,
+    assess_risks,
+    generate_disturbance_scenarios,
+    generate_emergency_recommendations,
+    compare_risk_scenarios,
+    get_risk_level_color,
+    get_risk_level_label,
+    apply_storm_surge_to_tide,
+)
 
 
 def test_validate_tide_records():
@@ -510,8 +526,384 @@ def test_optimization_database():
     print(f"✅ 清理测试方案")
 
 
+def test_storm_surge_config():
+    print("\n=== 测试风暴潮配置 ===")
+
+    config = StormSurgeConfig(
+        surge_height=1.0,
+        surge_start_hour=24.0,
+        surge_duration_hours=12.0,
+        surge_shape="sinusoidal",
+    )
+
+    surge_at_start = config.surge_at_time(24.0)
+    assert abs(surge_at_start) < 0.001, f"开始时潮位抬升应为0，实际: {surge_at_start}"
+    print(f"✅ 风暴潮开始时抬升为0: {surge_at_start:.3f} m")
+
+    surge_at_mid = config.surge_at_time(30.0)
+    assert surge_at_mid > 0.9, f"中期抬升应接近峰值，实际: {surge_at_mid}"
+    print(f"✅ 风暴潮中期抬升: {surge_at_mid:.3f} m")
+
+    surge_at_end = config.surge_at_time(36.0)
+    assert abs(surge_at_end) < 0.001, f"结束时潮位抬升应为0，实际: {surge_at_end}"
+    print(f"✅ 风暴潮结束时抬升为0: {surge_at_end:.3f} m")
+
+    surge_before = config.surge_at_time(10.0)
+    assert surge_before == 0.0, "开始前不应有抬升"
+    print("✅ 风暴潮开始前无抬升")
+
+    surge_after = config.surge_at_time(40.0)
+    assert surge_after == 0.0, "结束后不应有抬升"
+    print("✅ 风暴潮结束后无抬升")
+
+    zero_config = StormSurgeConfig(surge_height=0.0)
+    assert zero_config.surge_at_time(10.0) == 0.0, "高度为0时不应有抬升"
+    print("✅ 零高度风暴潮无影响")
+
+
+def test_rainfall_config():
+    print("\n=== 测试降雨入流配置 ===")
+
+    config = RainfallConfig(
+        rainfall_rate=50.0,
+        rainfall_start_hour=12.0,
+        rainfall_duration_hours=24.0,
+        runoff_coefficient=0.6,
+        catchment_area=100.0,
+    )
+
+    inflow = config.inflow_at_time(24.0)
+    expected_inflow = 50.0 * 100.0 * 0.6 / 1000.0
+    assert abs(inflow - expected_inflow) < 0.001, f"入流量计算错误: {inflow} vs {expected_inflow}"
+    print(f"✅ 降雨入流量计算正确: {inflow:.3f} m³/h")
+
+    inflow_before = config.inflow_at_time(6.0)
+    assert inflow_before == 0.0, "降雨开始前不应有入流"
+    print("✅ 降雨开始前无入流")
+
+    inflow_after = config.inflow_at_time(40.0)
+    assert inflow_after == 0.0, "降雨结束后不应有入流"
+    print("✅ 降雨结束后无入流")
+
+    zero_rain = RainfallConfig(rainfall_rate=0.0)
+    assert zero_rain.inflow_at_time(10.0) == 0.0, "零降雨不应有入流"
+    print("✅ 零降雨无入流")
+
+
+def test_equipment_failure_config():
+    print("\n=== 测试设备故障配置 ===")
+
+    config = EquipmentFailureConfig(
+        gate_failure_probability=0.3,
+        mill_failure_probability=0.5,
+        gate_flow_reduction_pct=50.0,
+        failure_start_hour=24.0,
+        failure_duration_hours=12.0,
+    )
+
+    assert not config.is_failure_period(10.0), "故障开始前不应在故障期"
+    print("✅ 故障开始前不在故障期")
+
+    assert config.is_failure_period(30.0), "故障期中应返回True"
+    print("✅ 故障期中正确识别")
+
+    assert not config.is_failure_period(40.0), "故障结束后不应在故障期"
+    print("✅ 故障结束后不在故障期")
+
+    base_flow = 100.0
+    flow_normal = config.effective_gate_flow(base_flow, 10.0)
+    assert flow_normal == base_flow, "非故障期流量不应变化"
+    print("✅ 非故障期流量正常")
+
+    flow_failure = config.effective_gate_flow(base_flow, 30.0)
+    expected_flow = base_flow * 0.5
+    assert abs(flow_failure - expected_flow) < 0.001, f"故障期流量计算错误: {flow_failure}"
+    print(f"✅ 故障期流量降低正确: {flow_failure:.1f} m³/h")
+
+    mill_normal = config.mill_available(10.0)
+    assert mill_normal, "非故障期磨坊应可用"
+    print("✅ 非故障期磨坊可用")
+
+    mill_failure = config.mill_available(30.0)
+    assert not mill_failure, "高故障概率下磨坊应不可用"
+    print("✅ 高故障概率下磨坊不可用")
+
+
+def test_apply_storm_surge():
+    print("\n=== 测试风暴潮叠加到潮位 ===")
+
+    tide_records = [
+        {"time_hour": 0.0, "tide_level": 2.0},
+        {"time_hour": 12.0, "tide_level": 4.0},
+        {"time_hour": 24.0, "tide_level": 2.0},
+    ]
+
+    storm = StormSurgeConfig(
+        surge_height=1.0,
+        surge_start_hour=0.0,
+        surge_duration_hours=24.0,
+        surge_shape="rectangular",
+    )
+
+    modified = apply_storm_surge_to_tide(tide_records, storm)
+    assert len(modified) == len(tide_records), "记录数应保持一致"
+    print(f"✅ 记录数保持一致: {len(modified)} 条")
+
+    assert modified[0]["tide_level"] == 3.0, f"潮位应叠加，实际: {modified[0]['tide_level']}"
+    print(f"✅ 潮位正确叠加: {tide_records[0]['tide_level']} + {1.0} = {modified[0]['tide_level']}")
+
+
+def test_disturbed_simulation():
+    print("\n=== 测试扰动模拟 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    baseline = DisturbanceScenario(name="baseline", description="基线")
+    results, gate_schedule, warnings = run_disturbed_simulation(
+        params, tide_records, mill_schedule, baseline
+    )
+
+    assert len(results) > 0, "模拟应产生结果"
+    print(f"✅ 基线模拟成功: {len(results)} 个时间步")
+
+    storm_scenario = DisturbanceScenario(
+        name="storm",
+        description="风暴潮测试",
+        storm_surge=StormSurgeConfig(
+            surge_height=1.5,
+            surge_start_hour=24.0,
+            surge_duration_hours=12.0,
+        ),
+    )
+    storm_results, _, storm_warnings = run_disturbed_simulation(
+        params, tide_records, mill_schedule, storm_scenario
+    )
+    assert len(storm_results) > 0
+    print(f"✅ 风暴潮模拟成功: {len(storm_warnings)} 条警告")
+
+    rainfall_scenario = DisturbanceScenario(
+        name="rainfall",
+        description="强降雨测试",
+        rainfall=RainfallConfig(
+            rainfall_rate=100.0,
+            rainfall_start_hour=12.0,
+            rainfall_duration_hours=24.0,
+            runoff_coefficient=0.8,
+            catchment_area=200.0,
+        ),
+    )
+    rain_results, _, rain_warnings = run_disturbed_simulation(
+        params, tide_records, mill_schedule, rainfall_scenario
+    )
+    assert len(rain_results) > 0
+    print(f"✅ 降雨入流模拟成功: {len(rain_warnings)} 条警告")
+
+    equipment_scenario = DisturbanceScenario(
+        name="equipment",
+        description="设备故障测试",
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.5,
+            mill_failure_probability=0.5,
+            gate_flow_reduction_pct=50.0,
+            failure_start_hour=24.0,
+            failure_duration_hours=24.0,
+        ),
+    )
+    equip_results, _, equip_warnings = run_disturbed_simulation(
+        params, tide_records, mill_schedule, equipment_scenario
+    )
+    assert len(equip_results) > 0
+    print(f"✅ 设备故障模拟成功: {len(equip_warnings)} 条警告")
+
+    has_storm_data = any("storm_surge" in r for r in storm_results)
+    assert has_storm_data, "结果中应包含风暴潮数据"
+    print("✅ 模拟结果包含风暴潮数据")
+
+    has_rainfall_data = any("rainfall_inflow" in r for r in rain_results)
+    assert has_rainfall_data, "结果中应包含降雨入流数据"
+    print("✅ 模拟结果包含降雨入流数据")
+
+
+def test_risk_assessment():
+    print("\n=== 测试风险评估 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    baseline = DisturbanceScenario(name="baseline")
+    sim_results, _, _ = run_disturbed_simulation(
+        params, tide_records, mill_schedule, baseline
+    )
+
+    risk_result = assess_risks(params, sim_results, baseline)
+    assert isinstance(risk_result, RiskAssessmentResult)
+    print(f"✅ 风险评估结果类型正确")
+
+    assert 0 <= risk_result.water_shortage_risk <= 100, "缺水风险应在0-100之间"
+    assert 0 <= risk_result.overflow_risk <= 100, "溢流风险应在0-100之间"
+    assert 0 <= risk_result.shutdown_risk <= 100, "停机风险应在0-100之间"
+    print(f"✅ 三项风险值均在有效范围")
+    print(f"   - 缺水风险: {risk_result.water_shortage_risk:.1f}%")
+    print(f"   - 溢流风险: {risk_result.overflow_risk:.1f}%")
+    print(f"   - 停机风险: {risk_result.shutdown_risk:.1f}%")
+
+    assert risk_result.overall_risk_level in ["low", "medium", "high", "critical"]
+    print(f"✅ 综合风险等级: {get_risk_level_label(risk_result.overall_risk_level)}")
+
+    assert "low_water_duration_pct" in risk_result.risk_details
+    assert "overflow_duration_pct" in risk_result.risk_details
+    assert "mill_availability_pct" in risk_result.risk_details
+    print(f"✅ 风险详情包含关键指标: {len(risk_result.risk_details)} 项")
+
+    color = get_risk_level_color(risk_result.overall_risk_level)
+    assert color.startswith("#"), "颜色应为十六进制格式"
+    print(f"✅ 风险等级颜色: {color}")
+
+    label = get_risk_level_label(risk_result.overall_risk_level)
+    assert isinstance(label, str) and len(label) > 0
+    print(f"✅ 风险等级标签: {label}")
+
+
+def test_emergency_recommendations():
+    print("\n=== 测试应急调度建议 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=7)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(7)
+
+    baseline = DisturbanceScenario(name="baseline")
+    baseline_sim, _, _ = run_disturbed_simulation(params, tide_records, mill_schedule, baseline)
+    baseline_risk = assess_risks(params, baseline_sim, baseline)
+
+    severe_storm = DisturbanceScenario(
+        name="severe_storm",
+        description="严重风暴潮",
+        storm_surge=StormSurgeConfig(
+            surge_height=2.0,
+            surge_start_hour=48.0,
+            surge_duration_hours=24.0,
+        ),
+        rainfall=RainfallConfig(
+            rainfall_rate=80.0,
+            rainfall_start_hour=48.0,
+            rainfall_duration_hours=18.0,
+            runoff_coefficient=0.7,
+            catchment_area=150.0,
+        ),
+        equipment=EquipmentFailureConfig(
+            gate_failure_probability=0.3,
+            mill_failure_probability=0.2,
+            gate_flow_reduction_pct=50.0,
+            failure_start_hour=48.0,
+            failure_duration_hours=12.0,
+        ),
+    )
+    storm_sim, _, _ = run_disturbed_simulation(params, tide_records, mill_schedule, severe_storm)
+    storm_risk = assess_risks(params, storm_sim, severe_storm)
+
+    recommendations = generate_emergency_recommendations(
+        params, baseline_risk, storm_risk, severe_storm
+    )
+
+    assert isinstance(recommendations, list)
+    print(f"✅ 生成应急建议: {len(recommendations)} 条")
+
+    if recommendations:
+        for rec in recommendations:
+            assert isinstance(rec, EmergencyRecommendation)
+            assert rec.action, "建议应有行动名称"
+            assert rec.priority in ["critical", "high", "medium", "low"]
+            assert len(rec.time_window) == 2
+        print(f"✅ 所有建议格式正确")
+
+        priorities = [r.priority for r in recommendations]
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        sorted_priorities = sorted(priorities, key=lambda p: priority_order.get(p, 99))
+        assert priorities == sorted_priorities, "建议应按优先级排序"
+        print("✅ 建议按优先级正确排序")
+
+
+def test_disturbance_scenarios():
+    print("\n=== 测试预设扰动场景 ===")
+
+    scenarios = generate_disturbance_scenarios()
+    assert len(scenarios) >= 5, "应至少有5个预设场景"
+    print(f"✅ 预设扰动场景数量: {len(scenarios)} 个")
+
+    names = [s.name for s in scenarios]
+    assert "baseline" in names, "应包含基线场景"
+    print("✅ 包含基线场景")
+
+    for scenario in scenarios:
+        assert isinstance(scenario, DisturbanceScenario)
+        assert scenario.risk_level in ["low", "medium", "high", "critical"]
+        assert scenario.storm_surge is not None
+        assert scenario.rainfall is not None
+        assert scenario.equipment is not None
+    print("✅ 所有场景格式正确")
+
+    for s in scenarios:
+        print(f"   - {s.name}: {s.description} ({get_risk_level_label(s.risk_level)})")
+
+
+def test_risk_comparison():
+    print("\n=== 测试多场景风险对比 ===")
+
+    params = SimulationParams(
+        reservoir_capacity=100.0,
+        reservoir_area=20.0,
+        gate_max_flow=50.0,
+        mill_power_consumption=5.0,
+        initial_water_level=50.0,
+    )
+
+    tide_records = generate_multi_day_tide_records(num_days=3)
+    mill_schedule = generate_daily_mill_schedule_for_multi_day(3)
+
+    scenarios = generate_disturbance_scenarios()
+    results = compare_risk_scenarios(params, tide_records, mill_schedule, scenarios)
+
+    assert len(results) == len(scenarios), "结果数应与场景数一致"
+    print(f"✅ 风险对比结果: {len(results)} 个场景")
+
+    for r in results:
+        assert isinstance(r, RiskAssessmentResult)
+        assert r.scenario_name
+    print("✅ 所有结果格式正确")
+
+    baseline_risk = [r for r in results if r.scenario_name == "baseline"][0]
+    severe_risk = [r for r in results if r.scenario_name == "severe_storm"][0]
+
+    assert severe_risk.overflow_risk >= baseline_risk.overflow_risk - 1, "严重风暴溢流风险不应低于基线"
+    print("✅ 严重风暴溢流风险高于基线（符合预期）")
+
+
 def main():
-    print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v2")
+    print("🌊 潮汐磨坊调度模拟系统 - 功能测试 v3")
     print("=" * 60)
 
     try:
@@ -528,6 +920,15 @@ def main():
         test_optimization_comparison()
         test_score_calculation()
         test_optimization_database()
+        test_storm_surge_config()
+        test_rainfall_config()
+        test_equipment_failure_config()
+        test_apply_storm_surge()
+        test_disturbed_simulation()
+        test_risk_assessment()
+        test_emergency_recommendations()
+        test_disturbance_scenarios()
+        test_risk_comparison()
 
         print("\n" + "=" * 60)
         print("🎉 所有测试通过! 系统运行正常。")

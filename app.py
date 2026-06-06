@@ -43,6 +43,21 @@ from database import (
     get_optimization_run_detail,
     delete_optimization_run,
 )
+from risk_assessment import (
+    StormSurgeConfig,
+    RainfallConfig,
+    EquipmentFailureConfig,
+    DisturbanceScenario,
+    RiskAssessmentResult,
+    EmergencyRecommendation,
+    run_disturbed_simulation,
+    assess_risks,
+    generate_disturbance_scenarios,
+    generate_emergency_recommendations,
+    compare_risk_scenarios,
+    get_risk_level_color,
+    get_risk_level_label,
+)
 
 
 st.set_page_config(
@@ -266,7 +281,7 @@ with st.sidebar:
         st.session_state["needs_simulation"] = True
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比", "📅 多日优化排程"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比", "📅 多日优化排程", "⚠️ 风险预警决策"])
 
 with tab1:
     st.header("方案信息")
@@ -1690,3 +1705,631 @@ with tab5:
                 st.dataframe(pd.DataFrame(runs_data), use_container_width=True, hide_index=True)
             else:
                 st.info("暂无历史优化记录")
+
+with tab6:
+    st.header("⚠️ 气象扰动与风险预警决策")
+    st.markdown("叠加风暴潮、降雨入流、设备故障等扰动因素，自动评估不同方案的缺水、溢流和停机风险，生成带风险等级的应急调度建议")
+
+    if "risk_disturbance_scenario" not in st.session_state:
+        st.session_state["risk_disturbance_scenario"] = "moderate_storm"
+    if "risk_assessment_results" not in st.session_state:
+        st.session_state["risk_assessment_results"] = None
+    if "risk_compare_results" not in st.session_state:
+        st.session_state["risk_compare_results"] = None
+    if "risk_emergency_recommendations" not in st.session_state:
+        st.session_state["risk_emergency_recommendations"] = None
+    if "custom_storm_surge" not in st.session_state:
+        st.session_state["custom_storm_surge"] = StormSurgeConfig()
+    if "custom_rainfall" not in st.session_state:
+        st.session_state["custom_rainfall"] = RainfallConfig()
+    if "custom_equipment" not in st.session_state:
+        st.session_state["custom_equipment"] = EquipmentFailureConfig()
+
+    preset_scenarios = generate_disturbance_scenarios()
+    scenario_dict = {s.name: s for s in preset_scenarios}
+
+    st.subheader("🎯 扰动场景选择")
+
+    col_s1, col_s2 = st.columns([2, 1])
+    with col_s1:
+        selected_scenario_name = st.selectbox(
+            "选择预设扰动场景",
+            options=[s.name for s in preset_scenarios],
+            format_func=lambda x: f"{scenario_dict[x].description} ({get_risk_level_label(scenario_dict[x].risk_level)})",
+            index=[s.name for s in preset_scenarios].index(st.session_state["risk_disturbance_scenario"])
+            if st.session_state["risk_disturbance_scenario"] in scenario_dict else 2,
+            key="risk_scenario_select",
+        )
+    with col_s2:
+        st.write("")
+        st.write("")
+        risk_color = get_risk_level_color(scenario_dict[selected_scenario_name].risk_level)
+        risk_label = get_risk_level_label(scenario_dict[selected_scenario_name].risk_level)
+        st.markdown(f"<span style='color:{risk_color};font-weight:bold;'>场景风险等级：{risk_label}</span>", unsafe_allow_html=True)
+
+    with st.expander("⚙️ 自定义扰动参数", expanded=False):
+        st.caption("调整以下参数可创建自定义扰动场景，将覆盖预设场景的设置")
+
+        col_c1, col_c2, col_c3 = st.columns(3)
+
+        with col_c1:
+            st.markdown("**🌊 风暴潮参数**")
+            surge_height = st.slider(
+                "潮位抬升高度 (m)",
+                min_value=0.0,
+                max_value=3.0,
+                value=scenario_dict[selected_scenario_name].storm_surge.surge_height,
+                step=0.1,
+                key="custom_surge_height",
+            )
+            surge_start = st.slider(
+                "开始时间 (小时)",
+                min_value=0.0,
+                max_value=168.0,
+                value=scenario_dict[selected_scenario_name].storm_surge.surge_start_hour,
+                step=1.0,
+                key="custom_surge_start",
+            )
+            surge_duration = st.slider(
+                "持续时间 (小时)",
+                min_value=1.0,
+                max_value=72.0,
+                value=scenario_dict[selected_scenario_name].storm_surge.surge_duration_hours,
+                step=1.0,
+                key="custom_surge_duration",
+            )
+            surge_shape = st.selectbox(
+                "潮位变化形态",
+                options=["sinusoidal", "triangular", "rectangular"],
+                format_func=lambda x: "正弦曲线" if x == "sinusoidal" else ("三角波" if x == "triangular" else "矩形波"),
+                index=["sinusoidal", "triangular", "rectangular"].index(
+                    scenario_dict[selected_scenario_name].storm_surge.surge_shape
+                ),
+                key="custom_surge_shape",
+            )
+
+        with col_c2:
+            st.markdown("**🌧️ 降雨入流参数**")
+            rainfall_rate = st.slider(
+                "降雨强度 (mm/h)",
+                min_value=0.0,
+                max_value=200.0,
+                value=scenario_dict[selected_scenario_name].rainfall.rainfall_rate,
+                step=5.0,
+                key="custom_rainfall_rate",
+            )
+            rainfall_start = st.slider(
+                "开始时间 (小时)",
+                min_value=0.0,
+                max_value=168.0,
+                value=scenario_dict[selected_scenario_name].rainfall.rainfall_start_hour,
+                step=1.0,
+                key="custom_rainfall_start",
+            )
+            rainfall_duration = st.slider(
+                "持续时间 (小时)",
+                min_value=1.0,
+                max_value=72.0,
+                value=scenario_dict[selected_scenario_name].rainfall.rainfall_duration_hours,
+                step=1.0,
+                key="custom_rainfall_duration",
+            )
+            runoff_coeff = st.slider(
+                "径流系数",
+                min_value=0.1,
+                max_value=1.0,
+                value=scenario_dict[selected_scenario_name].rainfall.runoff_coefficient,
+                step=0.05,
+                key="custom_runoff_coeff",
+            )
+            catchment_area = st.slider(
+                "集水面积 (m²)",
+                min_value=10.0,
+                max_value=500.0,
+                value=scenario_dict[selected_scenario_name].rainfall.catchment_area,
+                step=10.0,
+                key="custom_catchment_area",
+            )
+
+        with col_c3:
+            st.markdown("**🔧 设备故障参数**")
+            gate_fail_prob = st.slider(
+                "闸门故障概率",
+                min_value=0.0,
+                max_value=1.0,
+                value=scenario_dict[selected_scenario_name].equipment.gate_failure_probability,
+                step=0.05,
+                key="custom_gate_fail",
+            )
+            mill_fail_prob = st.slider(
+                "磨坊故障概率",
+                min_value=0.0,
+                max_value=1.0,
+                value=scenario_dict[selected_scenario_name].equipment.mill_failure_probability,
+                step=0.05,
+                key="custom_mill_fail",
+            )
+            gate_flow_reduction = st.slider(
+                "闸门流量降低 (%)",
+                min_value=0,
+                max_value=100,
+                value=int(scenario_dict[selected_scenario_name].equipment.gate_flow_reduction_pct),
+                step=5,
+                key="custom_gate_flow_red",
+            )
+            failure_start = st.slider(
+                "故障开始时间 (小时)",
+                min_value=0.0,
+                max_value=168.0,
+                value=scenario_dict[selected_scenario_name].equipment.failure_start_hour,
+                step=1.0,
+                key="custom_failure_start",
+            )
+            failure_duration = st.slider(
+                "故障持续时间 (小时)",
+                min_value=1.0,
+                max_value=72.0,
+                value=scenario_dict[selected_scenario_name].equipment.failure_duration_hours,
+                step=1.0,
+                key="custom_failure_duration",
+            )
+
+    st.divider()
+
+    st.subheader("📊 风险评估计算")
+
+    col_r1, col_r2, col_r3 = st.columns(3)
+    with col_r1:
+        if st.button("🔍 单场景风险评估", use_container_width=True, type="primary", key="run_single_risk"):
+            with st.spinner("正在进行风险评估计算..."):
+                try:
+                    params = SimulationParams(
+                        reservoir_capacity=st.session_state["reservoir_capacity"],
+                        reservoir_area=st.session_state["reservoir_area"],
+                        gate_max_flow=st.session_state["gate_max_flow"],
+                        mill_power_consumption=st.session_state["mill_power_consumption"],
+                        initial_water_level=st.session_state["initial_water_level"],
+                    )
+
+                    tide_data = st.session_state.get("multi_day_tide_records", generate_multi_day_tide_records(num_days=7))
+                    total_hours = get_total_hours(tide_data)
+                    effective_days = max(1, int(math.ceil(total_hours / 24)))
+
+                    custom_scenario = DisturbanceScenario(
+                        name="custom_scenario",
+                        description="用户自定义扰动场景",
+                        storm_surge=StormSurgeConfig(
+                            surge_height=surge_height,
+                            surge_start_hour=surge_start,
+                            surge_duration_hours=surge_duration,
+                            surge_shape=surge_shape,
+                        ),
+                        rainfall=RainfallConfig(
+                            rainfall_rate=rainfall_rate,
+                            rainfall_start_hour=rainfall_start,
+                            rainfall_duration_hours=rainfall_duration,
+                            runoff_coefficient=runoff_coeff,
+                            catchment_area=catchment_area,
+                        ),
+                        equipment=EquipmentFailureConfig(
+                            gate_failure_probability=gate_fail_prob,
+                            mill_failure_probability=mill_fail_prob,
+                            gate_flow_reduction_pct=float(gate_flow_reduction),
+                            failure_start_hour=failure_start,
+                            failure_duration_hours=failure_duration,
+                        ),
+                        risk_level="medium",
+                    )
+
+                    baseline_scenario = DisturbanceScenario(
+                        name="baseline",
+                        description="无扰动基线场景",
+                    )
+
+                    baseline_sim, _, _ = run_disturbed_simulation(
+                        params, tide_data,
+                        generate_daily_mill_schedule_for_multi_day(effective_days),
+                        baseline_scenario,
+                        total_hours=total_hours,
+                    )
+                    baseline_risk = assess_risks(params, baseline_sim, baseline_scenario)
+
+                    disturbed_sim, _, _ = run_disturbed_simulation(
+                        params, tide_data,
+                        generate_daily_mill_schedule_for_multi_day(effective_days),
+                        custom_scenario,
+                        total_hours=total_hours,
+                    )
+                    disturbed_risk = assess_risks(params, disturbed_sim, custom_scenario)
+
+                    recommendations = generate_emergency_recommendations(
+                        params, baseline_risk, disturbed_risk, custom_scenario
+                    )
+
+                    st.session_state["risk_assessment_results"] = {
+                        "baseline": baseline_risk,
+                        "disturbed": disturbed_risk,
+                    }
+                    st.session_state["risk_emergency_recommendations"] = recommendations
+                    st.session_state["risk_disturbance_scenario"] = selected_scenario_name
+
+                    st.success("✅ 风险评估计算完成!")
+                except Exception as e:
+                    st.error(f"风险评估失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    with col_r2:
+        if st.button("📊 所有场景对比", use_container_width=True, key="run_all_risk"):
+            with st.spinner("正在计算所有扰动场景的风险对比..."):
+                try:
+                    params = SimulationParams(
+                        reservoir_capacity=st.session_state["reservoir_capacity"],
+                        reservoir_area=st.session_state["reservoir_area"],
+                        gate_max_flow=st.session_state["gate_max_flow"],
+                        mill_power_consumption=st.session_state["mill_power_consumption"],
+                        initial_water_level=st.session_state["initial_water_level"],
+                    )
+
+                    tide_data = st.session_state.get("multi_day_tide_records", generate_multi_day_tide_records(num_days=7))
+                    total_hours = get_total_hours(tide_data)
+                    effective_days = max(1, int(math.ceil(total_hours / 24)))
+
+                    all_scenarios = generate_disturbance_scenarios()
+                    compare_results = compare_risk_scenarios(
+                        params, tide_data,
+                        generate_daily_mill_schedule_for_multi_day(effective_days),
+                        all_scenarios,
+                    )
+
+                    st.session_state["risk_compare_results"] = compare_results
+                    st.success("✅ 所有场景对比计算完成!")
+                except Exception as e:
+                    st.error(f"场景对比计算失败: {e}")
+
+    with col_r3:
+        if st.button("🔄 清除结果", use_container_width=True, key="clear_risk_results"):
+            st.session_state["risk_assessment_results"] = None
+            st.session_state["risk_compare_results"] = None
+            st.session_state["risk_emergency_recommendations"] = None
+            st.rerun()
+
+    st.divider()
+
+    if st.session_state.get("risk_assessment_results") is not None:
+        st.subheader("📈 单场景风险评估结果")
+
+        baseline_risk = st.session_state["risk_assessment_results"]["baseline"]
+        disturbed_risk = st.session_state["risk_assessment_results"]["disturbed"]
+
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            risk_color = get_risk_level_color(disturbed_risk.overall_risk_level)
+            risk_label = get_risk_level_label(disturbed_risk.overall_risk_level)
+            st.metric(
+                "综合风险等级",
+                risk_label,
+                delta=f"vs 基线: {get_risk_level_label(baseline_risk.overall_risk_level)}",
+                delta_color="inverse",
+            )
+            st.markdown(f"<div style='width:100%;height:10px;background:#e0e0e0;border-radius:5px;'><div style='width:100%;height:100%;background:{risk_color};border-radius:5px;'></div></div>", unsafe_allow_html=True)
+        with col_m2:
+            delta_short = disturbed_risk.water_shortage_risk - baseline_risk.water_shortage_risk
+            st.metric(
+                "缺水风险",
+                f"{disturbed_risk.water_shortage_risk:.1f}%",
+                delta=f"{delta_short:+.1f}%",
+                delta_color="inverse",
+            )
+        with col_m3:
+            delta_over = disturbed_risk.overflow_risk - baseline_risk.overflow_risk
+            st.metric(
+                "溢流风险",
+                f"{disturbed_risk.overflow_risk:.1f}%",
+                delta=f"{delta_over:+.1f}%",
+                delta_color="inverse",
+            )
+        with col_m4:
+            delta_shut = disturbed_risk.shutdown_risk - baseline_risk.shutdown_risk
+            st.metric(
+                "停机风险",
+                f"{disturbed_risk.shutdown_risk:.1f}%",
+                delta=f"{delta_shut:+.1f}%",
+                delta_color="inverse",
+            )
+
+        if disturbed_risk.warnings:
+            with st.expander(f"⚠️ 风险警告 ({len(disturbed_risk.warnings)} 条)", expanded=True):
+                for w in disturbed_risk.warnings:
+                    st.warning(w)
+
+        st.subheader("📊 详细风险指标对比")
+
+        risk_compare_data = [
+            {
+                "风险指标": "缺水风险",
+                "基线场景 (%)": round(baseline_risk.water_shortage_risk, 2),
+                "扰动场景 (%)": round(disturbed_risk.water_shortage_risk, 2),
+                "变化 (%)": round(disturbed_risk.water_shortage_risk - baseline_risk.water_shortage_risk, 2),
+            },
+            {
+                "风险指标": "溢流风险",
+                "基线场景 (%)": round(baseline_risk.overflow_risk, 2),
+                "扰动场景 (%)": round(disturbed_risk.overflow_risk, 2),
+                "变化 (%)": round(disturbed_risk.overflow_risk - baseline_risk.overflow_risk, 2),
+            },
+            {
+                "风险指标": "停机风险",
+                "基线场景 (%)": round(baseline_risk.shutdown_risk, 2),
+                "扰动场景 (%)": round(disturbed_risk.shutdown_risk, 2),
+                "变化 (%)": round(disturbed_risk.shutdown_risk - baseline_risk.shutdown_risk, 2),
+            },
+            {
+                "风险指标": "低水位持续时间占比",
+                "基线场景 (%)": baseline_risk.risk_details.get("low_water_duration_pct", 0),
+                "扰动场景 (%)": disturbed_risk.risk_details.get("low_water_duration_pct", 0),
+                "变化 (%)": round(
+                    disturbed_risk.risk_details.get("low_water_duration_pct", 0) -
+                    baseline_risk.risk_details.get("low_water_duration_pct", 0), 2
+                ),
+            },
+            {
+                "风险指标": "溢流持续时间占比",
+                "基线场景 (%)": baseline_risk.risk_details.get("overflow_duration_pct", 0),
+                "扰动场景 (%)": disturbed_risk.risk_details.get("overflow_duration_pct", 0),
+                "变化 (%)": round(
+                    disturbed_risk.risk_details.get("overflow_duration_pct", 0) -
+                    baseline_risk.risk_details.get("overflow_duration_pct", 0), 2
+                ),
+            },
+            {
+                "风险指标": "磨坊可用率",
+                "基线场景 (%)": baseline_risk.risk_details.get("mill_availability_pct", 0),
+                "扰动场景 (%)": disturbed_risk.risk_details.get("mill_availability_pct", 0),
+                "变化 (%)": round(
+                    disturbed_risk.risk_details.get("mill_availability_pct", 0) -
+                    baseline_risk.risk_details.get("mill_availability_pct", 0), 2
+                ),
+            },
+        ]
+
+        st.dataframe(pd.DataFrame(risk_compare_data), use_container_width=True, hide_index=True)
+
+        st.subheader("📈 水位变化对比曲线")
+
+        df_baseline = pd.DataFrame(baseline_risk.simulation_results)
+        df_disturbed = pd.DataFrame(disturbed_risk.simulation_results)
+
+        fig_risk = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=("蓄水量对比 (m³)", "闸门开启比例对比 (%)", "扰动强度"),
+            row_heights=[0.4, 0.3, 0.3],
+        )
+
+        fig_risk.add_trace(
+            go.Scatter(
+                x=df_baseline["time_hour"] / 24,
+                y=df_baseline["water_volume"],
+                name="基线 - 蓄水量",
+                line=dict(color="#1f77b4", width=2),
+            ),
+            row=1,
+            col=1,
+        )
+        fig_risk.add_trace(
+            go.Scatter(
+                x=df_disturbed["time_hour"] / 24,
+                y=df_disturbed["water_volume"],
+                name="扰动 - 蓄水量",
+                line=dict(color="#d62728", width=2),
+            ),
+            row=1,
+            col=1,
+        )
+        fig_risk.add_hline(
+            y=st.session_state["reservoir_capacity"],
+            line_dash="dash",
+            line_color="red",
+            annotation_text="容量上限",
+            annotation_position="right",
+            row=1,
+            col=1,
+        )
+
+        fig_risk.add_trace(
+            go.Scatter(
+                x=df_baseline["time_hour"] / 24,
+                y=df_baseline["gate_open_ratio"],
+                name="基线 - 闸门",
+                line=dict(color="#1f77b4", width=2),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_risk.add_trace(
+            go.Scatter(
+                x=df_disturbed["time_hour"] / 24,
+                y=df_disturbed["gate_open_ratio"],
+                name="扰动 - 闸门",
+                line=dict(color="#d62728", width=2),
+            ),
+            row=2,
+            col=1,
+        )
+
+        if "storm_surge" in df_disturbed.columns:
+            fig_risk.add_trace(
+                go.Scatter(
+                    x=df_disturbed["time_hour"] / 24,
+                    y=df_disturbed["storm_surge"],
+                    name="风暴潮 (m)",
+                    line=dict(color="#ff7f0e", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(255, 127, 14, 0.2)",
+                ),
+                row=3,
+                col=1,
+            )
+        if "rainfall_inflow" in df_disturbed.columns:
+            fig_risk.add_trace(
+                go.Scatter(
+                    x=df_disturbed["time_hour"] / 24,
+                    y=df_disturbed["rainfall_inflow"],
+                    name="降雨入流 (m³/h)",
+                    line=dict(color="#2ca02c", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(44, 160, 44, 0.2)",
+                ),
+                row=3,
+                col=1,
+            )
+
+        fig_risk.update_layout(
+            height=700,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_risk.update_xaxes(title_text="时间 (天)", row=3, col=1)
+        fig_risk.update_yaxes(title_text="蓄水量 (m³)", row=1, col=1)
+        fig_risk.update_yaxes(title_text="开启比例 (%)", row=2, col=1, range=[0, 105])
+        fig_risk.update_yaxes(title_text="强度", row=3, col=1)
+
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+        st.divider()
+        st.subheader("🚨 应急调度建议")
+
+        recommendations = st.session_state.get("risk_emergency_recommendations", [])
+        if recommendations:
+            priority_colors = {
+                "critical": "#9400d3",
+                "high": "#d62728",
+                "medium": "#ff7f0e",
+                "low": "#2ca02c",
+            }
+            priority_labels = {
+                "critical": "紧急",
+                "high": "高优先级",
+                "medium": "中优先级",
+                "low": "低优先级",
+            }
+
+            for i, rec in enumerate(recommendations):
+                color = priority_colors.get(rec.priority, "#7f7f7f")
+                label = priority_labels.get(rec.priority, "未知")
+
+                with st.expander(f"{'🔴' if rec.priority == 'high' else '🟠' if rec.priority == 'medium' else '🟢'} {rec.action} ({label})", expanded=(i < 2)):
+                    st.markdown(f"<p style='color:{color};font-weight:bold;'>优先级：{label}</p>", unsafe_allow_html=True)
+                    st.write(f"**描述**：{rec.description}")
+                    st.write(f"**影响**：{rec.risk_impact}")
+                    st.write(f"**建议时间窗口**：第 {rec.time_window[0]/24:.2f} 天 - 第 {rec.time_window[1]/24:.2f} 天")
+
+                    if rec.details:
+                        st.write("**详细参数**：")
+                        for k, v in rec.details.items():
+                            st.caption(f"  • {k}: {v}")
+        else:
+            st.info("暂无应急调度建议")
+
+    if st.session_state.get("risk_compare_results") is not None and len(st.session_state["risk_compare_results"]) > 0:
+        st.divider()
+        st.subheader("📊 所有扰动场景风险对比")
+
+        compare_results = st.session_state["risk_compare_results"]
+
+        scenario_display = {
+            "baseline": "📊 基线",
+            "minor_storm": "🌊 小型风暴",
+            "moderate_storm": "⛈️ 中型风暴",
+            "severe_storm": "🌀 严重风暴",
+            "equipment_failure": "🔧 设备故障",
+            "heavy_rainfall": "🌧️ 强降雨",
+        }
+
+        compare_data = []
+        for res in compare_results:
+            compare_data.append({
+                "场景": scenario_display.get(res.scenario_name, res.scenario_name),
+                "综合风险等级": get_risk_level_label(res.overall_risk_level),
+                "缺水风险 (%)": round(res.water_shortage_risk, 1),
+                "溢流风险 (%)": round(res.overflow_risk, 1),
+                "停机风险 (%)": round(res.shutdown_risk, 1),
+                "磨坊运行 (h)": round(res.risk_details.get("total_mill_hours", 0), 1),
+                "溢流水量 (m³)": round(res.risk_details.get("overflow_volume", 0), 1),
+                "最低蓄水量 (m³)": round(res.risk_details.get("min_water_volume", 0), 1),
+            })
+
+        st.dataframe(pd.DataFrame(compare_data), use_container_width=True, hide_index=True)
+
+        st.subheader("📈 三项风险对比柱状图")
+
+        bar_compare_fig = go.Figure()
+
+        scenario_names = [scenario_display.get(r.scenario_name, r.scenario_name) for r in compare_results]
+
+        bar_compare_fig.add_trace(go.Bar(
+            x=scenario_names,
+            y=[r.water_shortage_risk for r in compare_results],
+            name="缺水风险 (%)",
+            marker_color="#ff7f0e",
+        ))
+        bar_compare_fig.add_trace(go.Bar(
+            x=scenario_names,
+            y=[r.overflow_risk for r in compare_results],
+            name="溢流风险 (%)",
+            marker_color="#d62728",
+        ))
+        bar_compare_fig.add_trace(go.Bar(
+            x=scenario_names,
+            y=[r.shutdown_risk for r in compare_results],
+            name="停机风险 (%)",
+            marker_color="#9467bd",
+        ))
+
+        bar_compare_fig.update_layout(
+            barmode="group",
+            height=400,
+            title="各场景三项风险指标对比",
+            yaxis_title="风险值 (%)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        st.plotly_chart(bar_compare_fig, use_container_width=True)
+
+        st.subheader("📉 蓄水量变化对比")
+
+        water_compare_fig = go.Figure()
+
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+        for i, res in enumerate(compare_results):
+            df_res = pd.DataFrame(res.simulation_results)
+            water_compare_fig.add_trace(
+                go.Scatter(
+                    x=df_res["time_hour"] / 24,
+                    y=df_res["water_volume"],
+                    name=scenario_display.get(res.scenario_name, res.scenario_name),
+                    line=dict(color=colors[i % len(colors)], width=2),
+                )
+            )
+
+        water_compare_fig.add_hline(
+            y=st.session_state["reservoir_capacity"],
+            line_dash="dash",
+            line_color="red",
+            annotation_text="容量上限",
+            annotation_position="right",
+        )
+
+        water_compare_fig.update_layout(
+            height=400,
+            title="各场景蓄水量变化对比",
+            xaxis_title="时间 (天)",
+            yaxis_title="蓄水量 (m³)",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        st.plotly_chart(water_compare_fig, use_container_width=True)
