@@ -92,6 +92,59 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS optimization_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id INTEGER NOT NULL,
+            optimization_target TEXT NOT NULL,
+            num_days INTEGER NOT NULL,
+            daily_mill_hours REAL NOT NULL,
+            score REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (scenario_id) REFERENCES scenarios (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS optimization_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            optimization_run_id INTEGER NOT NULL,
+            metric_key TEXT NOT NULL,
+            metric_value REAL NOT NULL,
+            FOREIGN KEY (optimization_run_id) REFERENCES optimization_runs (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS opt_mill_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            optimization_run_id INTEGER NOT NULL,
+            start_hour REAL NOT NULL,
+            end_hour REAL NOT NULL,
+            FOREIGN KEY (optimization_run_id) REFERENCES optimization_runs (id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS opt_gate_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            optimization_run_id INTEGER NOT NULL,
+            start_hour REAL NOT NULL,
+            end_hour REAL NOT NULL,
+            open_ratio REAL NOT NULL,
+            action TEXT NOT NULL,
+            FOREIGN KEY (optimization_run_id) REFERENCES optimization_runs (id) ON DELETE CASCADE
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -341,3 +394,124 @@ def get_simulation_results(scenario_id: int) -> Tuple[List[Dict], List[Dict]]:
 
     conn.close()
     return results, gate_schedule
+
+
+def save_optimization_run(
+    scenario_id: int,
+    optimization_target: str,
+    num_days: int,
+    daily_mill_hours: float,
+    score: float,
+    metrics: Dict,
+    mill_schedule: List[Dict],
+    gate_schedule: List[Dict],
+) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO optimization_runs (scenario_id, optimization_target, num_days, daily_mill_hours, score)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (scenario_id, optimization_target, num_days, daily_mill_hours, score),
+    )
+    run_id = cursor.lastrowid
+
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            cursor.execute(
+                """
+                INSERT INTO optimization_results (optimization_run_id, metric_key, metric_value)
+                VALUES (?, ?, ?)
+                """,
+                (run_id, key, float(value)),
+            )
+
+    for sched in mill_schedule:
+        cursor.execute(
+            """
+            INSERT INTO opt_mill_schedule (optimization_run_id, start_hour, end_hour)
+            VALUES (?, ?, ?)
+            """,
+            (run_id, sched["start_hour"], sched["end_hour"]),
+        )
+
+    for g in gate_schedule:
+        cursor.execute(
+            """
+            INSERT INTO opt_gate_schedule (optimization_run_id, start_hour, end_hour, open_ratio, action)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, g["start_hour"], g["end_hour"], g["open_ratio"], g["action"]),
+        )
+
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def get_optimization_runs(scenario_id: int) -> List[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT * FROM optimization_runs 
+        WHERE scenario_id = ? 
+        ORDER BY created_at DESC
+        """,
+        (scenario_id,),
+    )
+    runs = [dict(row) for row in cursor.fetchall()]
+
+    conn.close()
+    return runs
+
+
+def get_optimization_run_detail(run_id: int) -> Optional[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM optimization_runs WHERE id = ?", (run_id,))
+    run_row = cursor.fetchone()
+
+    if not run_row:
+        conn.close()
+        return None
+
+    run = dict(run_row)
+
+    cursor.execute(
+        "SELECT metric_key, metric_value FROM optimization_results WHERE optimization_run_id = ?",
+        (run_id,),
+    )
+    metrics = {}
+    for row in cursor.fetchall():
+        metrics[row["metric_key"]] = row["metric_value"]
+    run["metrics"] = metrics
+
+    cursor.execute(
+        "SELECT start_hour, end_hour FROM opt_mill_schedule WHERE optimization_run_id = ? ORDER BY start_hour",
+        (run_id,),
+    )
+    mill_schedule = [dict(row) for row in cursor.fetchall()]
+    run["mill_schedule"] = mill_schedule
+
+    cursor.execute(
+        "SELECT start_hour, end_hour, open_ratio, action FROM opt_gate_schedule WHERE optimization_run_id = ? ORDER BY start_hour",
+        (run_id,),
+    )
+    gate_schedule = [dict(row) for row in cursor.fetchall()]
+    run["gate_schedule"] = gate_schedule
+
+    conn.close()
+    return run
+
+
+def delete_optimization_run(run_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM optimization_runs WHERE id = ?", (run_id,))
+    conn.commit()
+    conn.close()

@@ -25,6 +25,22 @@ from simulation import (
     parse_tide_csv,
     generate_default_tide_records,
     generate_default_mill_schedule,
+    generate_multi_day_tide_records,
+    validate_multi_day_tide_records,
+    get_total_hours,
+    compute_simulation_metrics,
+    generate_daily_mill_schedule_for_multi_day,
+)
+from optimizer import (
+    run_full_optimization,
+    compare_optimization_targets,
+    OptimizationResult,
+)
+from database import (
+    save_optimization_run,
+    get_optimization_runs,
+    get_optimization_run_detail,
+    delete_optimization_run,
 )
 
 
@@ -249,7 +265,7 @@ with st.sidebar:
         st.session_state["needs_simulation"] = True
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 模拟结果", "🌊 潮位数据", "⚙️ 磨坊计划", "⚖️ 方案对比", "📅 多日优化排程"])
 
 with tab1:
     st.header("方案信息")
@@ -1058,3 +1074,579 @@ with tab4:
                         st.info("无闸门调度建议")
             else:
                 st.error("无法加载方案数据")
+
+with tab5:
+    st.header("📅 多日潮汐预测与自动优化排程")
+    st.markdown("导入连续多天潮位数据，自动计算最优闸门开闭与磨坊运行时段，支持多种优化目标")
+
+    if "multi_day_tide_records" not in st.session_state:
+        st.session_state["multi_day_tide_records"] = generate_multi_day_tide_records(num_days=7)
+    if "optimization_target" not in st.session_state:
+        st.session_state["optimization_target"] = "balanced"
+    if "optimization_days" not in st.session_state:
+        st.session_state["optimization_days"] = 7
+    if "daily_target_hours" not in st.session_state:
+        st.session_state["daily_target_hours"] = 8.0
+    if "optimization_results" not in st.session_state:
+        st.session_state["optimization_results"] = None
+    if "compare_results" not in st.session_state:
+        st.session_state["compare_results"] = None
+
+    st.subheader("📊 多日潮位数据")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        num_days_input = st.slider(
+            "预测天数",
+            min_value=1,
+            max_value=30,
+            value=st.session_state["optimization_days"],
+            step=1,
+            key="opt_days_slider",
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        if st.button("🔄 生成示例数据", use_container_width=True, key="gen_multi_day"):
+            st.session_state["multi_day_tide_records"] = generate_multi_day_tide_records(num_days=num_days_input)
+            st.session_state["optimization_days"] = num_days_input
+            st.success(f"已生成 {num_days_input} 天示例潮位数据")
+            st.rerun()
+
+    uploaded_multi_file = st.file_uploader(
+        "📁 上传多日潮位 CSV 文件",
+        type=["csv"],
+        help="CSV文件应包含时间（小时，从0开始）和潮位（米）两列，支持多天连续数据",
+        key="multi_day_upload",
+    )
+
+    if uploaded_multi_file is not None:
+        try:
+            csv_content = uploaded_multi_file.getvalue().decode("utf-8")
+            records, msg = parse_tide_csv(csv_content)
+            if records:
+                valid, valid_msg = validate_multi_day_tide_records(records, min_hours=24.0)
+                if valid:
+                    st.success(f"✅ {msg} - {valid_msg}")
+                    if st.button("📥 导入此数据", use_container_width=True, key="import_multi_day"):
+                        st.session_state["multi_day_tide_records"] = records
+                        total_hours = get_total_hours(records)
+                        st.session_state["optimization_days"] = max(1, int(total_hours / 24))
+                        st.success("多日潮位数据已导入")
+                        st.rerun()
+                else:
+                    st.error(f"❌ 数据验证失败: {valid_msg}")
+                    st.write(f"解析到 {len(records)} 条记录")
+            else:
+                st.error(f"❌ {msg}")
+        except Exception as e:
+            st.error(f"文件读取失败: {e}")
+
+    tide_multi_df = pd.DataFrame(st.session_state["multi_day_tide_records"])
+
+    with st.expander("📋 查看潮位数据明细", expanded=False):
+        st.dataframe(tide_multi_df, use_container_width=True, height=200)
+
+    total_hours = get_total_hours(st.session_state["multi_day_tide_records"])
+    actual_days = total_hours / 24
+
+    st.info(f"📊 当前数据覆盖 {total_hours:.1f} 小时 ({actual_days:.1f} 天)，共 {len(tide_multi_df)} 条记录")
+
+    preview_fig = go.Figure()
+    preview_fig.add_trace(
+        go.Scatter(
+            x=tide_multi_df["time_hour"],
+            y=tide_multi_df["tide_level"],
+            mode="lines",
+            name="潮位",
+            line=dict(color="#1f77b4", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(31, 119, 180, 0.15)",
+        )
+    )
+    preview_fig.update_layout(
+        xaxis_title="时间 (小时)",
+        yaxis_title="潮位 (m)",
+        height=300,
+        hovermode="x unified",
+    )
+    st.plotly_chart(preview_fig, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("🎯 优化目标设置")
+
+    target_options = {
+        "water_saving": "💧 节水模式 - 优先保持高水位，减少闸门开启",
+        "high_yield": "⚡ 高产模式 - 优先延长磨坊运行时间",
+        "low_overflow": "🌊 低溢流模式 - 优先减少蓄水池溢流",
+        "balanced": "⚖️ 均衡模式 - 综合平衡各指标",
+    }
+
+    col_t1, col_t2 = st.columns([2, 1])
+    with col_t1:
+        selected_target = st.selectbox(
+            "选择优化目标",
+            options=list(target_options.keys()),
+            format_func=lambda x: target_options[x],
+            index=list(target_options.keys()).index(st.session_state["optimization_target"])
+            if st.session_state["optimization_target"] in target_options else 3,
+            key="opt_target_select",
+        )
+    with col_t2:
+        daily_hours = st.slider(
+            "日均目标工时 (h)",
+            min_value=2.0,
+            max_value=16.0,
+            value=st.session_state["daily_target_hours"],
+            step=0.5,
+            key="daily_hours_slider",
+        )
+
+    target_descriptions = {
+        "water_saving": "节水模式适合水资源紧张的场景，策略是尽量减少闸门开启次数和时间，保持蓄水池高水位，优先保障关键时段的磨粉需求。",
+        "high_yield": "高产模式适合需要最大化产量的场景，策略是尽可能延长磨坊运行时间，充分利用潮汐周期补水，以产量最大化为首要目标。",
+        "low_overflow": "低溢流模式适合需要减少水资源浪费的场景，策略是精确控制闸门开闭时机，避免蓄水池满溢，提高水资源利用效率。",
+        "balanced": "均衡模式综合考虑产量、水位和溢流等多个因素，在各指标之间寻求最佳平衡点，适合大多数常规场景。",
+    }
+
+    st.info(f"💡 {target_descriptions.get(selected_target, '')}")
+
+    if st.button("🚀 开始优化计算", use_container_width=True, type="primary", key="run_optimization"):
+        with st.spinner("正在进行优化计算，请稍候..."):
+            try:
+                params = SimulationParams(
+                    reservoir_capacity=st.session_state["reservoir_capacity"],
+                    reservoir_area=st.session_state["reservoir_area"],
+                    gate_max_flow=st.session_state["gate_max_flow"],
+                    mill_power_consumption=st.session_state["mill_power_consumption"],
+                    initial_water_level=st.session_state["initial_water_level"],
+                )
+
+                result = run_full_optimization(
+                    params,
+                    st.session_state["multi_day_tide_records"],
+                    target=selected_target,
+                    num_days=st.session_state["optimization_days"],
+                    daily_mill_hours=daily_hours,
+                )
+
+                st.session_state["optimization_results"] = result
+                st.session_state["optimization_target"] = selected_target
+                st.session_state["daily_target_hours"] = daily_hours
+                st.success("✅ 优化计算完成!")
+            except Exception as e:
+                st.error(f"优化计算失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+    st.divider()
+
+    if st.session_state["optimization_results"] is not None:
+        opt_result = st.session_state["optimization_results"]
+        metrics = opt_result.metrics
+
+        st.subheader("📈 优化结果")
+
+        target_names = {
+            "water_saving": "💧 节水模式",
+            "high_yield": "⚡ 高产模式",
+            "low_overflow": "🌊 低溢流模式",
+            "balanced": "⚖️ 均衡模式",
+        }
+
+        st.metric("优化目标", target_names.get(opt_result.target, opt_result.target))
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(
+                "磨坊总运行时长",
+                f"{metrics.get('total_mill_hours', 0):.1f} h",
+                f"日均 {metrics.get('total_mill_hours', 0)/max(1, metrics.get('num_days', 1)):.1f} h",
+            )
+        with col2:
+            st.metric(
+                "闸门累计开启",
+                f"{metrics.get('total_gate_open_hours', 0):.1f} h",
+            )
+        with col3:
+            st.metric(
+                "溢流水量",
+                f"{metrics.get('overflow_volume', 0):.1f} m³",
+            )
+        with col4:
+            st.metric(
+                "平均库容利用率",
+                f"{metrics.get('capacity_utilization_pct', 0):.1f} %",
+            )
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("最高蓄水量", f"{metrics.get('max_water_volume', 0):.1f} m³")
+        with col2:
+            st.metric("最低蓄水量", f"{metrics.get('min_water_volume', 0):.1f} m³")
+        with col3:
+            st.metric("总补水量", f"{metrics.get('total_inflow', 0):.1f} m³")
+        with col4:
+            st.metric("优化评分", f"{opt_result.score:.1f}")
+
+        df_opt = pd.DataFrame(opt_result.simulation_results)
+
+        st.subheader("📊 多日水位变化曲线")
+
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=("潮位与蓄水池水位 (m)", "蓄水量 (m³)", "闸门开启比例 (%)"),
+            row_heights=[0.4, 0.3, 0.3],
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_opt["time_hour"] / 24,
+                y=df_opt["tide_level"],
+                name="潮位",
+                line=dict(color="#1f77b4", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(31, 119, 180, 0.1)",
+            ),
+            row=1,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_opt["time_hour"] / 24,
+                y=df_opt["water_level"],
+                name="蓄水池水位",
+                line=dict(color="#ff7f0e", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(255, 127, 14, 0.1)",
+            ),
+            row=1,
+            col=1,
+        )
+
+        for i, sched in enumerate(opt_result.mill_schedule):
+            if i == 0:
+                show_legend = True
+            else:
+                show_legend = False
+            fig.add_vrect(
+                x0=sched["start_hour"] / 24,
+                x1=sched["end_hour"] / 24,
+                fillcolor="green",
+                opacity=0.12,
+                layer="below",
+                line_width=0,
+                row=1,
+                col=1,
+            )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_opt["time_hour"] / 24,
+                y=df_opt["water_volume"],
+                name="蓄水量",
+                line=dict(color="#2ca02c", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(44, 160, 44, 0.1)",
+            ),
+            row=2,
+            col=1,
+        )
+
+        fig.add_hline(
+            y=st.session_state["reservoir_capacity"],
+            line_dash="dash",
+            line_color="red",
+            annotation_text="容量上限",
+            annotation_position="right",
+            row=2,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_opt["time_hour"] / 24,
+                y=df_opt["gate_open_ratio"],
+                name="闸门开启比例",
+                line=dict(color="#9467bd", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(148, 103, 189, 0.15)",
+            ),
+            row=3,
+            col=1,
+        )
+
+        fig.update_layout(
+            height=650,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        fig.update_xaxes(title_text="时间 (天)", row=3, col=1)
+        fig.update_yaxes(title_text="水位 (m)", row=1, col=1)
+        fig.update_yaxes(title_text="蓄水量 (m³)", row=2, col=1)
+        fig.update_yaxes(title_text="开启比例 (%)", row=3, col=1, range=[0, 105])
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("🚪 优化闸门调度建议")
+
+        if opt_result.gate_schedule:
+            gate_data = []
+            for g in opt_result.gate_schedule:
+                start_day = g["start_hour"] / 24
+                end_day = g["end_hour"] / 24
+                gate_data.append({
+                    "开始": f"第{start_day:.2f}天 ({format_hour(g['start_hour'] % 24)})",
+                    "结束": f"第{end_day:.2f}天 ({format_hour(g['end_hour'] % 24)})",
+                    "时长 (h)": round(g["end_hour"] - g["start_hour"], 1),
+                    "操作": g["action"],
+                    "开启比例 (%)": round(g["open_ratio"], 1),
+                })
+            st.dataframe(pd.DataFrame(gate_data), use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无闸门调度建议")
+
+        st.subheader("⚙️ 优化磨坊运行计划")
+
+        if opt_result.mill_schedule:
+            mill_data = []
+            for i, s in enumerate(opt_result.mill_schedule):
+                day = int(s["start_hour"] / 24) + 1
+                mill_data.append({
+                    "时段序号": i + 1,
+                    "日期": f"第 {day} 天",
+                    "开始时间": format_hour(s["start_hour"] % 24),
+                    "结束时间": format_hour(s["end_hour"] % 24),
+                    "时长 (h)": round(s["end_hour"] - s["start_hour"], 1),
+                })
+            st.dataframe(pd.DataFrame(mill_data), use_container_width=True, hide_index=True)
+
+            total_mill_time = sum(s["end_hour"] - s["start_hour"] for s in opt_result.mill_schedule)
+            st.caption(f"总计 {len(opt_result.mill_schedule)} 个磨粉时段，累计运行 {total_mill_time:.1f} 小时")
+
+        st.divider()
+
+        col_save1, col_save2, col_save3 = st.columns(3)
+        with col_save1:
+            if st.button("💾 保存优化结果", use_container_width=True, key="save_opt_result"):
+                if st.session_state.get("scenario_id"):
+                    run_id = save_optimization_run(
+                        st.session_state["scenario_id"],
+                        opt_result.target,
+                        st.session_state["optimization_days"],
+                        st.session_state["daily_target_hours"],
+                        opt_result.score,
+                        opt_result.metrics,
+                        opt_result.mill_schedule,
+                        opt_result.gate_schedule,
+                    )
+                    st.success(f"优化结果已保存，ID: {run_id}")
+                else:
+                    st.warning("请先保存方案，再保存优化结果")
+
+        with col_save2:
+            if st.button("🔍 四种目标对比", use_container_width=True, key="compare_all_targets"):
+                with st.spinner("正在计算四种优化目标的对比结果..."):
+                    try:
+                        params = SimulationParams(
+                            reservoir_capacity=st.session_state["reservoir_capacity"],
+                            reservoir_area=st.session_state["reservoir_area"],
+                            gate_max_flow=st.session_state["gate_max_flow"],
+                            mill_power_consumption=st.session_state["mill_power_consumption"],
+                            initial_water_level=st.session_state["initial_water_level"],
+                        )
+
+                        compare_results = compare_optimization_targets(
+                            params,
+                            st.session_state["multi_day_tide_records"],
+                            num_days=st.session_state["optimization_days"],
+                            daily_mill_hours=daily_hours,
+                        )
+                        st.session_state["compare_results"] = compare_results
+                        st.success("✅ 四种目标对比计算完成!")
+                    except Exception as e:
+                        st.error(f"对比计算失败: {e}")
+
+        with col_save3:
+            if st.button("🔄 清除结果", use_container_width=True, key="clear_opt_result"):
+                st.session_state["optimization_results"] = None
+                st.session_state["compare_results"] = None
+                st.rerun()
+
+    if st.session_state.get("compare_results") is not None and len(st.session_state["compare_results"]) > 0:
+        st.divider()
+        st.subheader("📊 四种优化策略对比分析")
+
+        compare_results = st.session_state["compare_results"]
+
+        target_display = {
+            "water_saving": "💧 节水",
+            "high_yield": "⚡ 高产",
+            "low_overflow": "🌊 低溢流",
+            "balanced": "⚖️ 均衡",
+        }
+
+        compare_metrics = []
+        for res in compare_results:
+            m = res.metrics
+            compare_metrics.append({
+                "优化目标": target_display.get(res.target, res.target),
+                "磨坊总时长 (h)": m.get("total_mill_hours", 0),
+                "闸门开启 (h)": m.get("total_gate_open_hours", 0),
+                "溢流水量 (m³)": m.get("overflow_volume", 0),
+                "平均库容 (%)": m.get("capacity_utilization_pct", 0),
+                "总补水 (m³)": m.get("total_inflow", 0),
+                "优化评分": res.score,
+            })
+
+        st.dataframe(pd.DataFrame(compare_metrics), use_container_width=True, hide_index=True)
+
+        st.subheader("📈 关键指标对比")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            bar_fig1 = go.Figure()
+            bar_fig1.add_trace(go.Bar(
+                x=[target_display.get(r.target, r.target) for r in compare_results],
+                y=[r.metrics.get("total_mill_hours", 0) for r in compare_results],
+                name="磨坊运行时长 (h)",
+                marker_color="#2ca02c",
+            ))
+            bar_fig1.update_layout(
+                title="磨坊运行时长对比",
+                height=300,
+            )
+            st.plotly_chart(bar_fig1, use_container_width=True)
+
+        with col2:
+            bar_fig2 = go.Figure()
+            bar_fig2.add_trace(go.Bar(
+                x=[target_display.get(r.target, r.target) for r in compare_results],
+                y=[r.metrics.get("overflow_volume", 0) for r in compare_results],
+                name="溢流水量 (m³)",
+                marker_color="#d62728",
+            ))
+            bar_fig2.update_layout(
+                title="溢流水量对比",
+                height=300,
+            )
+            st.plotly_chart(bar_fig2, use_container_width=True)
+
+        with col3:
+            bar_fig3 = go.Figure()
+            bar_fig3.add_trace(go.Bar(
+                x=[target_display.get(r.target, r.target) for r in compare_results],
+                y=[r.metrics.get("capacity_utilization_pct", 0) for r in compare_results],
+                name="平均库容利用率 (%)",
+                marker_color="#ff7f0e",
+            ))
+            bar_fig3.update_layout(
+                title="平均库容利用率对比",
+                height=300,
+            )
+            st.plotly_chart(bar_fig3, use_container_width=True)
+
+        st.subheader("📉 水位变化对比")
+
+        compare_fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=("蓄水量对比 (m³)", "闸门开启比例对比 (%)"),
+            row_heights=[0.6, 0.4],
+        )
+
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd"]
+
+        for i, res in enumerate(compare_results):
+            df_res = pd.DataFrame(res.simulation_results)
+            compare_fig.add_trace(
+                go.Scatter(
+                    x=df_res["time_hour"] / 24,
+                    y=df_res["water_volume"],
+                    name=f"{target_display.get(res.target, res.target)} 蓄水量",
+                    line=dict(color=colors[i % len(colors)], width=2),
+                ),
+                row=1,
+                col=1,
+            )
+
+        compare_fig.add_hline(
+            y=st.session_state["reservoir_capacity"],
+            line_dash="dash",
+            line_color="red",
+            annotation_text="容量上限",
+            annotation_position="right",
+            row=1,
+            col=1,
+        )
+
+        for i, res in enumerate(compare_results):
+            df_res = pd.DataFrame(res.simulation_results)
+            compare_fig.add_trace(
+                go.Scatter(
+                    x=df_res["time_hour"] / 24,
+                    y=df_res["gate_open_ratio"],
+                    name=f"{target_display.get(res.target, res.target)} 闸门",
+                    line=dict(color=colors[i % len(colors)], width=2),
+                ),
+                row=2,
+                col=1,
+            )
+
+        compare_fig.update_layout(
+            height=550,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        compare_fig.update_xaxes(title_text="时间 (天)", row=2, col=1)
+        compare_fig.update_yaxes(title_text="蓄水量 (m³)", row=1, col=1)
+        compare_fig.update_yaxes(title_text="开启比例 (%)", row=2, col=1, range=[0, 105])
+
+        st.plotly_chart(compare_fig, use_container_width=True)
+
+        st.subheader("📋 各策略闸门调度对比")
+
+        for res in compare_results:
+            with st.expander(f"{target_display.get(res.target, res.target)} 模式 - 闸门调度详情", expanded=False):
+                if res.gate_schedule:
+                    gate_detail = []
+                    for g in res.gate_schedule:
+                        gate_detail.append({
+                            "开始时间": format_hour(g["start_hour"]),
+                            "结束时间": format_hour(g["end_hour"]),
+                            "时长 (h)": round(g["end_hour"] - g["start_hour"], 1),
+                            "操作": g["action"],
+                            "比例 (%)": round(g["open_ratio"], 1),
+                        })
+                    st.dataframe(pd.DataFrame(gate_detail), use_container_width=True, hide_index=True)
+
+        if st.session_state.get("scenario_id"):
+            st.divider()
+            st.subheader("📚 历史优化记录")
+
+            opt_runs = get_optimization_runs(st.session_state["scenario_id"])
+            if opt_runs:
+                st.info(f"共有 {len(opt_runs)} 条历史优化记录")
+
+                runs_data = []
+                for run in opt_runs:
+                    runs_data.append({
+                        "ID": run["id"],
+                        "优化目标": target_display.get(run["optimization_target"], run["optimization_target"]),
+                        "天数": run["num_days"],
+                        "日均工时 (h)": run["daily_mill_hours"],
+                        "评分": run["score"],
+                        "创建时间": run["created_at"],
+                    })
+                st.dataframe(pd.DataFrame(runs_data), use_container_width=True, hide_index=True)
+            else:
+                st.info("暂无历史优化记录")

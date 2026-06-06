@@ -431,3 +431,125 @@ def generate_default_mill_schedule() -> List[Dict]:
         {"start_hour": 8.0, "end_hour": 12.0},
         {"start_hour": 14.0, "end_hour": 18.0},
     ]
+
+
+def generate_multi_day_tide_records(num_days: int = 7, base_level: float = 2.5, amplitude: float = 2.0) -> List[Dict]:
+    records = []
+    total_hours = num_days * 24.0
+    step_hours = 1.0
+
+    t = 0.0
+    while t <= total_hours + 0.001:
+        tide_level = base_level + amplitude * math.sin(2 * math.pi * (t - 6) / 12.4)
+        spring_neap_factor = 0.85 + 0.15 * math.sin(2 * math.pi * t / (14.8 * 24))
+        tide_level = base_level + amplitude * spring_neap_factor * math.sin(2 * math.pi * (t - 6) / 12.4)
+        records.append({"time_hour": round(t, 2), "tide_level": round(tide_level, 2)})
+        t += step_hours
+
+    return records
+
+
+def validate_multi_day_tide_records(tide_records: List[Dict], min_hours: float = 24.0) -> Tuple[bool, str]:
+    if not tide_records:
+        return False, "潮位记录不能为空"
+
+    if len(tide_records) < 2:
+        return False, "至少需要2条潮位记录"
+
+    for i, record in enumerate(tide_records):
+        if "time_hour" not in record or "tide_level" not in record:
+            return False, f"第 {i+1} 条记录格式不正确"
+        if record["time_hour"] < 0:
+            return False, f"第 {i+1} 条记录的时间不能为负值"
+        if record["tide_level"] < 0:
+            return False, f"第 {i+1} 条记录的潮位不能为负值"
+
+    sorted_records = sorted(tide_records, key=lambda r: r["time_hour"])
+
+    for i in range(len(sorted_records) - 1):
+        if sorted_records[i]["time_hour"] == sorted_records[i + 1]["time_hour"]:
+            return False, f"存在重复的时间点: {sorted_records[i]['time_hour']}"
+
+    total_span = sorted_records[-1]["time_hour"] - sorted_records[0]["time_hour"]
+    if total_span < min_hours - 0.01:
+        return False, f"潮位记录覆盖时长不足 {min_hours} 小时，当前仅 {total_span:.1f} 小时"
+
+    if sorted_records[0]["time_hour"] > 0.01:
+        return False, f"潮位记录必须从0小时开始，当前起始时间: {sorted_records[0]['time_hour']} 小时"
+
+    return True, f"潮位记录有效，覆盖 {total_span:.1f} 小时 ({total_span/24:.1f} 天)"
+
+
+def get_total_hours(tide_records: List[Dict]) -> float:
+    sorted_records = sorted(tide_records, key=lambda r: r["time_hour"])
+    return sorted_records[-1]["time_hour"] - sorted_records[0]["time_hour"]
+
+
+def generate_daily_mill_schedule_for_multi_day(
+    num_days: int,
+    daily_schedule: List[Dict] = None,
+) -> List[Dict]:
+    if daily_schedule is None:
+        daily_schedule = generate_default_mill_schedule()
+
+    full_schedule = []
+    for day in range(num_days):
+        day_offset = day * 24.0
+        for sched in daily_schedule:
+            full_schedule.append({
+                "start_hour": day_offset + sched["start_hour"],
+                "end_hour": day_offset + sched["end_hour"],
+            })
+
+    return full_schedule
+
+
+def compute_simulation_metrics(results: List[Dict], params: SimulationParams) -> Dict:
+    if not results:
+        return {}
+
+    water_volumes = [r["water_volume"] for r in results]
+    gate_ratios = [r["gate_open_ratio"] for r in results]
+    mill_running = [r["mill_running"] for r in results]
+    tide_levels = [r["tide_level"] for r in results]
+
+    time_step = params.time_step_hours
+
+    total_mill_hours = sum(1 for m in mill_running if m) * time_step
+
+    total_gate_open_hours = sum(1 for g in gate_ratios if g > 0.5) * time_step
+
+    total_inflow = 0.0
+    total_outflow = 0.0
+    for i in range(1, len(results)):
+        vol_change = water_volumes[i] - water_volumes[i - 1]
+        mill_consumed = params.mill_power_consumption * time_step if mill_running[i] else 0.0
+        net_flow = vol_change + mill_consumed
+        if net_flow > 0:
+            total_inflow += net_flow
+        else:
+            total_outflow += abs(net_flow)
+
+    overflow_volume = 0.0
+    for i in range(len(results)):
+        if water_volumes[i] >= params.reservoir_capacity - 0.01:
+            if i < len(results) - 1 and gate_ratios[i] > 0:
+                overflow_volume += params.gate_max_flow * (gate_ratios[i] / 100.0) * time_step * 0.1
+
+    avg_water_level = sum(water_volumes) / len(water_volumes)
+    capacity_utilization = avg_water_level / params.reservoir_capacity * 100
+
+    return {
+        "total_mill_hours": round(total_mill_hours, 2),
+        "total_gate_open_hours": round(total_gate_open_hours, 2),
+        "total_inflow": round(total_inflow, 2),
+        "total_outflow": round(total_outflow, 2),
+        "overflow_volume": round(overflow_volume, 2),
+        "avg_water_volume": round(avg_water_level, 2),
+        "capacity_utilization_pct": round(capacity_utilization, 2),
+        "max_water_volume": round(max(water_volumes), 2),
+        "min_water_volume": round(min(water_volumes), 2),
+        "max_tide_level": round(max(tide_levels), 2),
+        "min_tide_level": round(min(tide_levels), 2),
+        "num_days": round((results[-1]["time_hour"] - results[0]["time_hour"]) / 24, 2),
+    }
