@@ -2130,7 +2130,9 @@ with tab6:
     if st.session_state.get("risk_assessment_results") is not None:
         baseline_risk = st.session_state["risk_assessment_results"]["baseline"]
         disturbed_risk = st.session_state["risk_assessment_results"]["disturbed"]
-        is_prob = disturbed_risk.is_probabilistic if hasattr(disturbed_risk, 'is_probabilistic') and disturbed_risk.is_probabilistic
+        is_prob = bool(
+            hasattr(disturbed_risk, "is_probabilistic") and disturbed_risk.is_probabilistic
+        )
 
         if is_prob:
             st.subheader("📈 概率风险评估结果（蒙特卡洛）")
